@@ -1,0 +1,18 @@
+[project]
+name = "gpt2-repro"
+version = "0.1.0"
+description = "A from-scratch reproduction of GPT-2 pretraining, classification, and instruction tuning"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets",
+    "huggingface-hub",
+    "numpy",
+    "pyarrow>=25.0.1",
+    "safetensors",
+    "tiktoken>=0.14.0",
+    "torch",
+]
+
+[tool.uv]
+package = false
