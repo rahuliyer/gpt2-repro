@@ -36,6 +36,7 @@ class TrainingConfig:
     eval_iters: int = 20
     fused_optimizer: bool = False
     checkpoint_interval: int = 1000
+    keep_last_n: int = 3
     checkpoint_name: str = "gpt2"
     wandb_project: str = "gpt2-repro-test"
 
@@ -162,6 +163,23 @@ def check_resume_config(saved_config, config):
     ]
     for line in changed:
         print(f"warning: config changed since the checkpoint: {line}")
+
+
+def prune_checkpoints(run_dir, keep_last_n):
+    """Delete all but the newest `keep_last_n` state checkpoints of this run.
+
+    Only touches `step_*.pt` inside this run's own `checkpoints/` directory, so
+    the final `.safetensors` weights and other runs are never at risk. A
+    non-positive `keep_last_n` keeps everything.
+    """
+    if keep_last_n <= 0:
+        return []
+    # Step numbers are zero padded, so lexicographic order is step order.
+    checkpoints = sorted((Path(run_dir) / "checkpoints").glob("step_*.pt"))
+    stale = checkpoints[:-keep_last_n]
+    for path in stale:
+        path.unlink()
+    return stale
 
 
 def save_state(path, model, optimizer, config, step, grad_accum_steps):
@@ -408,6 +426,12 @@ def train(config, train_path, val_path, run_dir, state=None):
                 grad_accum_steps,
             )
             print(f"Saved state checkpoint to {written}")
+            removed = prune_checkpoints(run_dir, config.keep_last_n)
+            if removed:
+                print(
+                    f"Pruned {len(removed)} old checkpoint(s), "
+                    f"keeping the newest {config.keep_last_n}"
+                )
 
         step_started = now
 
@@ -433,6 +457,7 @@ def train(config, train_path, val_path, run_dir, state=None):
     if not final_state.exists():
         save_state(final_state, model, optimizer, config, step, grad_accum_steps)
         print(f"Saved state checkpoint to {final_state}")
+        prune_checkpoints(run_dir, config.keep_last_n)
 
     return model, loss_value, final_val_loss, step
 

@@ -101,6 +101,76 @@ class OffsetSamplerTests(unittest.TestCase):
         self.assertEqual(list(train.OffsetSampler(0, offset=3)), [])
 
 
+class PruneCheckpointsTests(unittest.TestCase):
+    def test_keeps_only_the_newest_n(self):
+        with TemporaryDirectory() as directory:
+            run = Path(directory) / "gpt2_20260930_090000"
+            for step in (1000, 2000, 3000, 4000, 5000):
+                make_checkpoint(directory, run.name, step)
+
+            removed = train.prune_checkpoints(run, 3)
+
+            remaining = sorted(p.name for p in (run / "checkpoints").iterdir())
+
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(
+            remaining,
+            ["step_003000.pt", "step_004000.pt", "step_005000.pt"],
+        )
+
+    def test_keeps_everything_when_under_the_limit(self):
+        with TemporaryDirectory() as directory:
+            run = Path(directory) / "gpt2_20260930_090000"
+            for step in (1000, 2000):
+                make_checkpoint(directory, run.name, step)
+
+            removed = train.prune_checkpoints(run, 3)
+
+            self.assertEqual(removed, [])
+            self.assertEqual(len(list((run / "checkpoints").iterdir())), 2)
+
+    def test_non_positive_keeps_everything(self):
+        with TemporaryDirectory() as directory:
+            run = Path(directory) / "gpt2_20260930_090000"
+            for step in (1000, 2000, 3000):
+                make_checkpoint(directory, run.name, step)
+
+            self.assertEqual(train.prune_checkpoints(run, 0), [])
+            self.assertEqual(len(list((run / "checkpoints").iterdir())), 3)
+
+    def test_leaves_the_final_weights_alone(self):
+        with TemporaryDirectory() as directory:
+            run = Path(directory) / "gpt2_20260930_090000"
+            for step in (1000, 2000, 3000):
+                make_checkpoint(directory, run.name, step)
+            weights = run / "gpt2_step_003000.safetensors"
+            weights.touch()
+
+            train.prune_checkpoints(run, 1)
+
+            # Pruning only ever removes step_*.pt under checkpoints/.
+            self.assertTrue(weights.exists())
+
+    def test_never_touches_another_run(self):
+        with TemporaryDirectory() as directory:
+            mine = Path(directory) / "gpt2_20260930_090000"
+            for step in (1000, 2000, 3000):
+                make_checkpoint(directory, mine.name, step)
+            other = make_checkpoint(directory, "gpt2_20261001_120000", 1000)
+
+            train.prune_checkpoints(mine, 1)
+
+            self.assertTrue(other.exists())
+            self.assertEqual(len(list((mine / "checkpoints").iterdir())), 1)
+
+    def test_survives_a_run_with_no_checkpoints_yet(self):
+        with TemporaryDirectory() as directory:
+            run = Path(directory) / "gpt2_20260930_090000"
+            (run / "checkpoints").mkdir(parents=True)
+
+            self.assertEqual(train.prune_checkpoints(run, 3), [])
+
+
 class ResumeConfigTests(unittest.TestCase):
     def test_accepts_an_identical_config(self):
         config = train.TrainingConfig()
