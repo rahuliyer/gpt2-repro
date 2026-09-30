@@ -13,10 +13,18 @@ dependencies = [
     "tiktoken>=0.14.0",
     "torch",
     "transformers>=5.17.0",
+    "wandb>=0.30.0",
 ]
 
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["model", "data"]
+
 [tool.uv]
-package = false
+package = true
 
 [dependency-groups]
 dev = [
