@@ -5,10 +5,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import math
 from pathlib import Path
+import sys
 import time
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 import torch.nn.functional as F
 import wandb
 
@@ -34,14 +35,57 @@ class TrainingConfig:
     eval_interval: int = 50
     eval_iters: int = 20
     fused_optimizer: bool = False
+    checkpoint_interval: int = 1000
     checkpoint_name: str = "gpt2"
     wandb_project: str = "gpt2-repro-test"
 
 
-def checkpoint_path(checkpoint_dir, config, now=None):
-    """Build a timestamped checkpoint path so a run never overwrites another."""
+def run_directory(checkpoint_dir, config, now=None):
+    """Build a timestamped directory so a fresh run never reuses another's."""
     stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
-    return Path(checkpoint_dir) / f"{config.checkpoint_name}_{stamp}.safetensors"
+    return Path(checkpoint_dir) / f"{config.checkpoint_name}_{stamp}"
+
+
+def state_checkpoint_path(run_dir, step):
+    """Path of the full-training-state checkpoint for `step`."""
+    return Path(run_dir) / "checkpoints" / f"step_{step:06d}.pt"
+
+
+def model_checkpoint_path(run_dir, config, step):
+    """Path of the final safetensors weights, tagged with the step that produced them."""
+    return Path(run_dir) / f"{config.checkpoint_name}_step_{step:06d}.safetensors"
+
+
+def find_latest_checkpoint(checkpoint_dir, config):
+    """Return the newest state checkpoint under `checkpoint_dir`, or None.
+
+    Run directories carry a sortable %Y%m%d_%H%M%S stamp and step files are
+    zero padded, so lexicographic order is chronological then step order.
+    """
+    pattern = f"{config.checkpoint_name}_*/checkpoints/step_*.pt"
+    checkpoints = sorted(Path(checkpoint_dir).glob(pattern))
+    return checkpoints[-1] if checkpoints else None
+
+
+class OffsetSampler(Sampler):
+    """Sequential order starting at `offset`, wrapping to cover every index once.
+
+    Resuming mid-file needs the data stream to pick up where it stopped; without
+    it a resumed run re-trains on the start of the file and may never reach the
+    end. Generating indices lazily keeps this O(1) in memory, which matters when
+    the dataset has millions of examples.
+    """
+
+    def __init__(self, length, offset=0):
+        self.length = length
+        self.offset = offset % length if length else 0
+
+    def __iter__(self):
+        for i in range(self.length):
+            yield (self.offset + i) % self.length
+
+    def __len__(self):
+        return self.length
 
 
 def get_lr(step, config):
@@ -72,17 +116,87 @@ def cycle(dataloader):
         yield from dataloader
 
 
-def build_dataloader(dataset_path, config):
-    """Open a token file and wrap it in a dataloader."""
+def build_dataloader(dataset_path, config, offset=0):
+    """Open a token file and wrap it in a dataloader.
+
+    `offset` starts iteration at that example index instead of 0, which is how
+    a resumed run picks the data stream back up. At offset 0 the order is
+    identical to plain sequential iteration.
+    """
     dataset = FineWebDataset(str(dataset_path), config.context_len)
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=False,
+        sampler=OffsetSampler(len(dataset), offset),
         num_workers=config.num_workers,
         persistent_workers=config.num_workers > 0,
     )
     return dataset, dataloader
+
+
+# Changing any of these invalidates the restored step counter, so a resume
+# cannot silently continue with a different value.
+INCOMPATIBLE_ON_RESUME = ("total_batch_size", "batch_size", "context_len")
+
+
+def check_resume_config(saved_config, config):
+    """Raise on config changes that break resume, warn on the rest."""
+    current = asdict(config)
+    conflicts = [
+        f"{field}: checkpoint has {saved_config[field]!r}, config has {current[field]!r}"
+        for field in INCOMPATIBLE_ON_RESUME
+        if field in saved_config and saved_config[field] != current[field]
+    ]
+    if conflicts:
+        raise ValueError(
+            "cannot resume, these settings must match the checkpoint:\n  "
+            + "\n  ".join(conflicts)
+        )
+
+    changed = [
+        f"{field}: {saved_config[field]!r} -> {current[field]!r}"
+        for field in sorted(saved_config)
+        if field not in INCOMPATIBLE_ON_RESUME
+        and field in current
+        and saved_config[field] != current[field]
+    ]
+    for line in changed:
+        print(f"warning: config changed since the checkpoint: {line}")
+
+
+def save_state(path, model, optimizer, config, step, grad_accum_steps):
+    """Write everything needed to continue this run later."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "step": step,
+        # The uncompiled module: torch.compile prefixes state_dict keys with
+        # "_orig_mod.", which will not load back into a plain GPT2.
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": asdict(config),
+        "examples_consumed": step * grad_accum_steps * config.batch_size,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+        "wandb_run_id": wandb.run.id if wandb.run is not None else None,
+    }
+    torch.save(state, path)
+    return path
+
+
+def load_state(path):
+    """Read a state checkpoint written by `save_state`."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def restore_rng_state(state):
+    """Put the RNGs back where the checkpoint left them."""
+    if state.get("torch_rng_state") is not None:
+        torch.set_rng_state(state["torch_rng_state"].cpu().to(torch.uint8))
+    cuda_state = state.get("cuda_rng_state")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
 
 def build_optimizer(model, config):
     decay_params = []
@@ -146,8 +260,12 @@ def estimate_val_loss(model, val_dataloader, device, use_bf16, max_batches=None)
     return (total_loss / batches if batches else float("nan")), batches
 
 
-def train(config, train_path, val_path):
-    """Train a model and return it with the final train and validation losses."""
+def train(config, train_path, val_path, run_dir, state=None):
+    """Train a model and return it with the final train and validation losses.
+
+    `state` is a checkpoint from `load_state`; when given, training continues
+    from its step with the optimizer, RNG and data position restored.
+    """
     torch.manual_seed(config.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # including_emulation=False: is_bf16_supported() defaults to True on GPUs
@@ -159,12 +277,36 @@ def train(config, train_path, val_path):
     model = GPT2(
         GPT2SmallConfig(context_len=config.context_len, dropout=config.dropout)
     ).to(device)
+
+    step = 0
+    examples_consumed = 0
+    if state is not None:
+        check_resume_config(state["config"], config)
+        # Load into the plain module before compiling, so the key names match.
+        model.load_state_dict(state["model"])
+        step = state["step"]
+        examples_consumed = state.get("examples_consumed", 0)
+        # Drop the CPU copy now that it lives on the device.
+        del state["model"]
+
     optimizer = build_optimizer(model, config)
+    if state is not None:
+        optimizer.load_state_dict(state["optimizer"])
+        del state["optimizer"]
+        restore_rng_state(state)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print(f"Compiling model...")
     compiled_model = torch.compile(model)
 
-    dataset, dataloader = build_dataloader(train_path, config)
+    # Peek at the dataset length to turn examples consumed into an offset,
+    # then build the loader once with that offset already applied.
+    probe = FineWebDataset(str(train_path), config.context_len)
+    offset = examples_consumed % len(probe) if len(probe) else 0
+    del probe
+    dataset, dataloader = build_dataloader(train_path, config, offset=offset)
+    # Validation always scores the same prefix, so it never takes an offset.
     _, val_dataloader = build_dataloader(val_path, config)
 
     precision = "bf16 (autocast)" if use_bf16 else "fp32"
@@ -175,8 +317,13 @@ def train(config, train_path, val_path):
         f"| {config.max_steps:,} steps max"
     )
 
+    if state is not None:
+        print(
+            f"Resuming at step {step:,} "
+            f"(example offset {offset:,} of {len(dataset):,})"
+        )
+
     model.train()
-    step = 0
     loss_value = float("nan")
     started = time.monotonic()
     step_started = started
@@ -251,6 +398,17 @@ def train(config, train_path, val_path):
                 metrics["val/loss"] = val_loss
             wandb.log(metrics, step=step)
 
+        if step % config.checkpoint_interval == 0:
+            written = save_state(
+                state_checkpoint_path(run_dir, step),
+                model,
+                optimizer,
+                config,
+                step,
+                grad_accum_steps,
+            )
+            print(f"Saved state checkpoint to {written}")
+
         step_started = now
 
     total_tokens = step * config.total_batch_size
@@ -270,7 +428,13 @@ def train(config, train_path, val_path):
         f"{final_val_loss:.4f}"
     )
 
-    return model, loss_value, final_val_loss
+    # The loop already wrote this step if it landed on the interval.
+    final_state = state_checkpoint_path(run_dir, step)
+    if not final_state.exists():
+        save_state(final_state, model, optimizer, config, step, grad_accum_steps)
+        print(f"Saved state checkpoint to {final_state}")
+
+    return model, loss_value, final_val_loss, step
 
 
 def main(argv=None):
@@ -293,18 +457,54 @@ def main(argv=None):
         "--checkpoint-dir",
         required=True,
         type=Path,
-        help="Directory to write the timestamped safetensors checkpoint into.",
+        help="Directory holding per-run checkpoint directories.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue the most recent run found under --checkpoint-dir.",
     )
     args = parser.parse_args(argv)
 
     config = TrainingConfig()
-    wandb.init(project=config.wandb_project, config=asdict(config))
 
-    model, _, final_val_loss = train(config, args.train_dataset, args.val_dataset)
+    state = None
+    if args.resume:
+        latest = find_latest_checkpoint(args.checkpoint_dir, config)
+        if latest is None:
+            print(
+                f"error: --resume found no checkpoint under {args.checkpoint_dir}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Resuming from {latest}")
+        state = load_state(latest)
+        # A resumed run continues inside the directory it came from.
+        run_dir = latest.parent.parent
+    else:
+        run_dir = run_directory(args.checkpoint_dir, config)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reusing the run id keeps one continuous curve across restarts.
+    wandb.init(
+        project=config.wandb_project,
+        config=asdict(config),
+        id=state.get("wandb_run_id") if state else None,
+        resume="allow",
+    )
+
+    try:
+        model, _, final_val_loss, step = train(
+            config, args.train_dataset, args.val_dataset, run_dir, state
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        wandb.finish(exit_code=1)
+        return 1
+
     wandb.summary["final_val_loss"] = final_val_loss
 
-    checkpoint = checkpoint_path(args.checkpoint_dir, config)
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = model_checkpoint_path(run_dir, config, step)
     model.save(str(checkpoint))
     print(f"Saved model to {checkpoint}")
 
