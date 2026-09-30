@@ -91,9 +91,19 @@ active.
 ### Logging
 
 Every step logs loss, learning rate, pre-clip gradient norm, throughput, and
-timing. Validation runs a full pass over the validation file every
-`eval_interval` steps — note this scales with validation size, so raise
-`eval_interval` or lower `VAL_TOKEN_CAP` if evaluation starts to dominate.
+timing.
+
+Validation is measured two ways. During training, every `eval_interval` steps
+scores `eval_iters` batches — a cheap sample, and since the loader is not
+shuffled it is always the same prefix, so the periodic values are comparable
+to each other step over step. After the loop, one full pass over the whole
+validation file produces the number actually worth reporting, which is what
+`train()` returns and what lands in the W&B run summary.
+
+The two are not directly comparable, so they are labelled differently in the
+output. Keep `eval_iters` modest: a full pass over a 50M-token validation set
+is tens of thousands of batches, which is fine once at the end but would
+dominate the run if done at every interval.
 
 Runs are tracked in Weights & Biases under the `wandb_project` name.
 `wandb.init()` happens in `main()`, and the training loop only logs when a run

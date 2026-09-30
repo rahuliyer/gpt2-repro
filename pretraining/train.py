@@ -32,6 +32,7 @@ class TrainingConfig:
     seed: int = 1337
     log_interval: int = 1
     eval_interval: int = 50
+    eval_iters: int = 20
     wandb_project: str = "gpt2-repro-test"
 
 
@@ -77,13 +78,20 @@ def build_dataloader(dataset_path, config):
 
 
 @torch.no_grad()
-def estimate_val_loss(model, val_dataloader, device, use_bf16):
-    """Return the mean loss over the entire validation set."""
+def estimate_val_loss(model, val_dataloader, device, use_bf16, max_batches=None):
+    """Return the mean validation loss.
+
+    ``max_batches`` caps how much of the validation file is scored; None runs
+    a full pass. The loader is not shuffled, so a capped call always scores the
+    same prefix, which keeps the periodic estimates comparable step to step.
+    """
     model.eval()
     total_loss = 0.0
     batches = 0
 
     for x, y in val_dataloader:
+        if max_batches is not None and batches >= max_batches:
+            break
         x = x.to(device)
         y = y.to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -136,7 +144,6 @@ def train(config, train_path, val_path):
     model.train()
     step = 0
     loss_value = float("nan")
-    last_val_loss = float("nan")
     started = time.monotonic()
     step_started = started
     batches = cycle(dataloader)
@@ -184,9 +191,8 @@ def train(config, train_path, val_path):
         val_batches = 0
         if step % config.eval_interval == 0:
             val_loss, val_batches = estimate_val_loss(
-                model, val_dataloader, device, use_bf16
+                model, val_dataloader, device, use_bf16, config.eval_iters
             )
-            last_val_loss = val_loss
 
         if step % config.log_interval == 0:
             message = (
@@ -216,11 +222,21 @@ def train(config, train_path, val_path):
     total_tokens = step * config.total_batch_size
     print(
         f"Completed: {step:,} steps ({total_tokens:,} tokens), "
-        f"final train loss {loss_value:.4f}, "
-        f"last val loss {last_val_loss:.4f}"
+        f"final train loss {loss_value:.4f}"
     )
 
-    return model, loss_value, last_val_loss
+    # The periodic numbers above are a cheap prefix sample; score the whole
+    # validation file once at the end for the number worth reporting.
+    final_val_loss, val_batches = estimate_val_loss(
+        model, val_dataloader, device, use_bf16
+    )
+    print(
+        f"Final validation loss over {val_batches:,} batches "
+        f"({val_batches * config.batch_size * config.context_len:,} tokens): "
+        f"{final_val_loss:.4f}"
+    )
+
+    return model, loss_value, final_val_loss
 
 
 def main(argv=None):
