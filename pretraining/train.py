@@ -9,7 +9,6 @@ import time
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-import torch.optim as optim
 import wandb
 
 from pretraining import FineWebDataset
@@ -33,6 +32,7 @@ class TrainingConfig:
     log_interval: int = 1
     eval_interval: int = 50
     eval_iters: int = 20
+    fused_optimizer: bool = False
     wandb_project: str = "gpt2-repro-test"
 
 
@@ -76,6 +76,37 @@ def build_dataloader(dataset_path, config):
     )
     return dataset, dataloader
 
+def build_optimizer(model, config):
+    decay_params = []
+    no_decay_params = []
+
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if param.dim() >= 2:
+            decay_params.append(param)
+        else:
+            no_decay_params.append(param)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": decay_params,
+                "weight_decay": config.weight_decay,
+            },
+            {
+                "params": no_decay_params,
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=config.max_lr,
+        betas=config.betas,
+        eps=1e-8,
+        fused=config.fused_optimizer
+    )
+
+    return optimizer
 
 @torch.no_grad()
 def estimate_val_loss(model, val_dataloader, device, use_bf16, max_batches=None):
@@ -120,12 +151,7 @@ def train(config, train_path, val_path):
     model = GPT2(
         GPT2SmallConfig(context_len=config.context_len, dropout=config.dropout)
     ).to(device)
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config.max_lr,
-        betas=config.betas,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_optimizer(model, config)
 
     print(f"Compiling model...")
     compiled_model = torch.compile(model)
