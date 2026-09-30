@@ -48,16 +48,23 @@ budget disk accordingly. The `datasets/` directory is gitignored.
 
 ```bash
 uv run python pretraining/train.py \
-    datasets/fineweb/train.bin \
-    datasets/fineweb/val.bin \
-    checkpoints/gpt2.safetensors
+    --train-dataset datasets/fineweb/train.bin \
+    --val-dataset datasets/fineweb/val.bin \
+    --checkpoint-dir checkpoints
 ```
+
+The checkpoint directory is created if missing, and the filename is built
+from `checkpoint_name` in the config plus a timestamp — for example
+`checkpoints/gpt2_20260930_143022.safetensors` — so consecutive runs never
+overwrite each other.
 
 Hyperparameters live in the `TrainingConfig` dataclass at the top of
 `pretraining/train.py` — edit them there rather than passing flags. The
 defaults follow the GPT-2 paper: AdamW at 6e-4 with betas (0.9, 0.95) and
-0.1 weight decay, gradient clipping at 1.0, 100 warmup steps, and a cosine
-decay to 6e-5.
+0.1 weight decay applied to matrices but not to biases or LayerNorm scales,
+gradient clipping at 1.0, 100 warmup steps, and a cosine decay to 6e-5.
+Weights initialize from N(0, 0.02), with the residual-path projections
+scaled by `1 / sqrt(2 * n_layers)`.
 
 ### Effective batch size
 

@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import asdict, dataclass
+from datetime import datetime
 import math
 from pathlib import Path
 import time
@@ -33,7 +34,14 @@ class TrainingConfig:
     eval_interval: int = 50
     eval_iters: int = 20
     fused_optimizer: bool = False
+    checkpoint_name: str = "gpt2"
     wandb_project: str = "gpt2-repro-test"
+
+
+def checkpoint_path(checkpoint_dir, config, now=None):
+    """Build a timestamped checkpoint path so a run never overwrites another."""
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return Path(checkpoint_dir) / f"{config.checkpoint_name}_{stamp}.safetensors"
 
 
 def get_lr(step, config):
@@ -270,31 +278,35 @@ def main(argv=None):
         description="Pretrain GPT-2 on a tokenized dataset file."
     )
     parser.add_argument(
-        "train_data",
+        "--train-dataset",
+        required=True,
         type=Path,
         help="Path to the uint16 training token file from pretraining/preprocess.py.",
     )
     parser.add_argument(
-        "val_data",
+        "--val-dataset",
+        required=True,
         type=Path,
         help="Path to the uint16 validation token file from pretraining/preprocess.py.",
     )
     parser.add_argument(
-        "checkpoint",
+        "--checkpoint-dir",
+        required=True,
         type=Path,
-        help="Path to save the trained model weights (safetensors).",
+        help="Directory to write the timestamped safetensors checkpoint into.",
     )
     args = parser.parse_args(argv)
 
     config = TrainingConfig()
     wandb.init(project=config.wandb_project, config=asdict(config))
 
-    model, _, final_val_loss = train(config, args.train_data, args.val_data)
+    model, _, final_val_loss = train(config, args.train_dataset, args.val_dataset)
     wandb.summary["final_val_loss"] = final_val_loss
 
-    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    model.save(str(args.checkpoint))
-    print(f"Saved model to {args.checkpoint}")
+    checkpoint = checkpoint_path(args.checkpoint_dir, config)
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model.save(str(checkpoint))
+    print(f"Saved model to {checkpoint}")
 
     wandb.finish()
     return 0
