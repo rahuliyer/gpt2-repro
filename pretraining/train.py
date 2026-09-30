@@ -44,6 +44,9 @@ def train(config, dataset_path):
         weight_decay=config.weight_decay,
     )
 
+    print(f"Compiling model...")
+    compiled_model = torch.compile(model)
+
     dataset = FineWebDataset(str(dataset_path), config.context_len)
     dataloader = DataLoader(
         dataset,
@@ -66,7 +69,7 @@ def train(config, dataset_path):
 
             optimizer.zero_grad()
 
-            logits = model(x)
+            logits = compiled_model(x)
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 y.reshape(-1),
@@ -104,10 +107,19 @@ def main(argv=None):
         type=Path,
         help="Path to the uint16 token file produced by data/preprocess.py.",
     )
+    parser.add_argument(
+        "checkpoint",
+        type=Path,
+        help="Path to save the trained model weights (safetensors).",
+    )
     args = parser.parse_args(argv)
 
     config = TrainingConfig()
-    train(config, args.dataset)
+    model, _ = train(config, args.dataset)
+
+    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(args.checkpoint))
+    print(f"Saved model to {args.checkpoint}")
 
     return 0
 
