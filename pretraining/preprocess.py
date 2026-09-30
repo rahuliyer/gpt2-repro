@@ -143,7 +143,11 @@ def preprocess_dataset(
             if not isinstance(text, str):
                 raise ValueError(f"row {row_number} has a non-string 'text' field")
 
-            tokens = tokenizer.encode(text)
+            # Some FineWeb documents contain the literal string "<|endoftext|>".
+            # tiktoken refuses to encode special tokens by default; allowing it
+            # would turn dataset text into a real document boundary, so encode
+            # it as ordinary text and keep the appended EOT as the only one.
+            tokens = tokenizer.encode(text, disallowed_special=())
             tokens.append(tokenizer.eot_token)
             if max_tokens is not None:
                 remaining_tokens = max_tokens - token_count

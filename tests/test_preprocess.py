@@ -13,7 +13,9 @@ from pretraining import preprocess
 class FakeTokenizer:
     eot_token = 99
 
-    def encode(self, text):
+    def encode(self, text, disallowed_special=None):
+        # Mirrors tiktoken's signature so the call in preprocess_dataset is
+        # exercised as written.
         return [ord(character) for character in text]
 
 
@@ -171,6 +173,32 @@ class PreprocessTests(unittest.TestCase):
             )
 
         self.assertIn("Processed 1/200 rows (0.5%)", progress.getvalue())
+
+    def test_literal_endoftext_in_a_document_is_ordinary_text(self):
+        # FineWeb documents sometimes contain the literal "<|endoftext|>".
+        # tiktoken raises on it unless disallowed_special is cleared, and
+        # allowing it would inject a spurious document boundary.
+        import tiktoken
+
+        tokenizer = tiktoken.get_encoding("gpt2")
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            rows, tokens_written = preprocess.preprocess_dataset(
+                [{"text": "before <|endoftext|> after"}],
+                filename,
+                tokenizer,
+                progress_stream=StringIO(),
+            )
+            tokens = np.fromfile(filename, dtype=np.uint16).tolist()
+
+        self.assertEqual(rows, 1)
+        # Exactly one EOT, the one appended as the document terminator.
+        self.assertEqual(tokens.count(tokenizer.eot_token), 1)
+        self.assertEqual(tokens[-1], tokenizer.eot_token)
+        # The literal text round-trips instead of becoming a boundary.
+        self.assertEqual(
+            tokenizer.decode(tokens[:-1]), "before <|endoftext|> after"
+        )
 
     def test_split_train_val_splits_ninety_ten(self):
         with TemporaryDirectory() as directory:
