@@ -1,8 +1,7 @@
-"""Stream a Hugging Face dataset into a GPT-2 token file."""
+"""Stream the FineWeb 10BT sample into GPT-2 train and validation token files."""
 
 import argparse
 from collections.abc import Mapping
-from itertools import islice
 import os
 from pathlib import Path
 import sys
@@ -12,6 +11,12 @@ from datasets import load_dataset
 import numpy as np
 import tiktoken
 
+
+DATASET_ID = "HuggingFaceFW/fineweb"
+DATASET_NAME = "sample-10BT"
+DATASET_SPLIT = "train"
+TRAIN_FRACTION = 0.9
+TOKEN_BYTES = 2  # uint16
 
 PROGRESS_INTERVAL = 1_000
 PROGRESS_UPDATES = 100
@@ -28,60 +33,37 @@ def positive_int(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Tokenize a Hugging Face dataset for GPT-2 training."
+        description="Tokenize the FineWeb 10BT sample into train and val token files."
     )
     parser.add_argument(
-        "--filename",
-        required=True,
+        "train_filename",
         type=Path,
-        help="Output path for the raw uint16 token file.",
+        help="Output path for the training tokens (raw uint16).",
     )
     parser.add_argument(
-        "--dataset-id",
-        required=True,
-        help="Hugging Face dataset repository ID.",
-    )
-    parser.add_argument(
-        "--dataset-name",
-        help="Optional Hugging Face dataset config or subset name.",
-    )
-    parser.add_argument(
-        "--num-rows",
-        type=positive_int,
-        help="Maximum rows to process; omitted means the entire split.",
+        "val_filename",
+        type=Path,
+        help="Output path for the validation tokens (raw uint16).",
     )
     parser.add_argument(
         "--max-tokens",
         "--max_tokens",
         dest="max_tokens",
         type=positive_int,
-        help="Maximum tokens to write; the final row may be truncated.",
-    )
-    parser.add_argument(
-        "--type",
-        required=True,
-        choices=("train", "val", "test"),
-        dest="split_type",
-        help="Dataset split to process. 'val' maps to 'validation'.",
+        help="Total tokens to write across both files; omitted means the whole sample.",
     )
     return parser.parse_args(argv)
 
 
-def load_streaming_dataset(
-    dataset_id, dataset_name, split_type
-):
-    """Load the requested dataset split without materializing it in memory."""
-    split = "validation" if split_type == "val" else split_type
-    options = {"split": split, "streaming": True}
-    if dataset_name is not None:
-        options["name"] = dataset_name
-    return load_dataset(dataset_id, **options)
+def load_streaming_dataset():
+    """Load the FineWeb 10BT sample without materializing it in memory."""
+    return load_dataset(
+        DATASET_ID, name=DATASET_NAME, split=DATASET_SPLIT, streaming=True
+    )
 
 
-def resolve_total_rows(dataset, num_rows):
+def resolve_total_rows(dataset):
     """Return the expected number of rows, or None when it is unknown."""
-    if num_rows is not None:
-        return num_rows
     splits = getattr(getattr(dataset, "info", None), "splits", None)
     if not splits:
         return None
@@ -125,15 +107,14 @@ def preprocess_dataset(
     dataset,
     filename,
     tokenizer,
-    num_rows=None,
     max_tokens=None,
     *,
     progress_stream=sys.stderr,
     progress_interval=PROGRESS_INTERVAL,
 ):
     """Tokenize dataset rows and return the numbers of rows and tokens written."""
-    total_rows = resolve_total_rows(dataset, num_rows)
-    rows = islice(dataset, num_rows) if num_rows is not None else iter(dataset)
+    total_rows = resolve_total_rows(dataset)
+    rows = iter(dataset)
     row_count = 0
     token_count = 0
     started = time.monotonic()
@@ -202,26 +183,62 @@ def preprocess_dataset(
     return row_count, token_count
 
 
+def split_train_val(
+    train_filename,
+    val_filename,
+    train_fraction=TRAIN_FRACTION,
+    *,
+    progress_stream=sys.stderr,
+):
+    """Carve the tail off a token file into a separate validation file.
+
+    The train file is written first as one contiguous stream; this moves the
+    last ``1 - train_fraction`` of it into ``val_filename`` and truncates the
+    train file in place, so only the validation tokens are ever copied.
+    """
+    tokens = np.memmap(train_filename, dtype=np.uint16, mode="r")
+    total_tokens = len(tokens)
+    if total_tokens == 0:
+        del tokens
+        raise ValueError(f"{train_filename} is empty, nothing to split")
+
+    split_index = round(total_tokens * train_fraction)
+    tokens[split_index:].tofile(val_filename)
+    # Release the mapping before resizing the file underneath it.
+    del tokens
+    os.truncate(train_filename, split_index * TOKEN_BYTES)
+
+    val_tokens = total_tokens - split_index
+    print(
+        f"Split {total_tokens:,} tokens: {split_index:,} train "
+        f"({100 * split_index / total_tokens:.1f}%) -> {train_filename}, "
+        f"{val_tokens:,} val -> {val_filename}",
+        file=progress_stream,
+        flush=True,
+    )
+    return split_index, val_tokens
+
+
 def main(argv=None):
     args = parse_args(argv)
 
     try:
-        dataset = load_streaming_dataset(
-            args.dataset_id, args.dataset_name, args.split_type
-        )
+        dataset = load_streaming_dataset()
     except Exception as exc:
         print(f"error: failed to load dataset: {exc}", file=sys.stderr)
         return 1
 
     try:
         tokenizer = tiktoken.get_encoding("gpt2")
+        args.train_filename.parent.mkdir(parents=True, exist_ok=True)
+        args.val_filename.parent.mkdir(parents=True, exist_ok=True)
         preprocess_dataset(
             dataset,
-            args.filename,
+            args.train_filename,
             tokenizer,
-            args.num_rows,
             args.max_tokens,
         )
+        split_train_val(args.train_filename, args.val_filename)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

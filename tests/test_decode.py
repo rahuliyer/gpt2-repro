@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from data import decode
+from pretraining import decode
 
 
 class FakeTokenizer:
@@ -38,7 +38,7 @@ class DecodeTests(unittest.TestCase):
 
         self.assertEqual(text, "abc")
 
-    @patch("data.decode.tiktoken.get_encoding", return_value=FakeTokenizer())
+    @patch("pretraining.decode.tiktoken.get_encoding", return_value=FakeTokenizer())
     def test_main_writes_to_stdout_by_default(self, _get_encoding):
         with TemporaryDirectory() as directory:
             filename = Path(directory) / "tokens.bin"
@@ -51,7 +51,7 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "abc")
 
-    @patch("data.decode.tiktoken.get_encoding", return_value=FakeTokenizer())
+    @patch("pretraining.decode.tiktoken.get_encoding", return_value=FakeTokenizer())
     def test_main_writes_to_target_file(self, _get_encoding):
         with TemporaryDirectory() as directory:
             filename = Path(directory) / "tokens.bin"
@@ -65,7 +65,7 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(target_filename.read_text(encoding="utf-8"), "hé")
 
-    @patch("data.decode.tiktoken.get_encoding", return_value=FakeTokenizer())
+    @patch("pretraining.decode.tiktoken.get_encoding", return_value=FakeTokenizer())
     def test_main_reports_read_errors(self, _get_encoding):
         error = StringIO()
 

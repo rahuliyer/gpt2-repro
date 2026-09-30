@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import torch.optim as optim
 
-from data import FineWebDataset
+from pretraining import FineWebDataset
 from model import GPT2, GPT2SmallConfig
 
 
@@ -141,7 +141,7 @@ def main(argv=None):
     parser.add_argument(
         "dataset",
         type=Path,
-        help="Path to the uint16 token file produced by data/preprocess.py.",
+        help="Path to the uint16 token file produced by pretraining/preprocess.py.",
     )
     parser.add_argument(
         "checkpoint",

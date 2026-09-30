@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from data import FineWebDataset
+from pretraining import FineWebDataset
 
 
 class FineWebDatasetTests(unittest.TestCase):

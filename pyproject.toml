@@ -21,7 +21,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["model", "data"]
+packages = ["model", "pretraining"]
 
 [tool.uv]
 package = true

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from data import preprocess
+from pretraining import preprocess
 
 
 class FakeTokenizer:
@@ -39,75 +39,29 @@ class FakeInfoDataset:
 
 
 class PreprocessTests(unittest.TestCase):
-    def test_limits_are_optional(self):
-        args = preprocess.parse_args(
-            [
-                "--filename",
-                "tokens.bin",
-                "--dataset-id",
-                "owner/dataset",
-                "--type",
-                "train",
-            ]
-        )
+    def test_parses_output_paths_and_optional_token_limit(self):
+        args = preprocess.parse_args(["train.bin", "val.bin"])
 
-        self.assertIsNone(args.num_rows)
+        self.assertEqual(args.train_filename, Path("train.bin"))
+        self.assertEqual(args.val_filename, Path("val.bin"))
         self.assertIsNone(args.max_tokens)
-
-    def test_num_rows_must_be_positive(self):
-        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            preprocess.parse_args(
-                [
-                    "--filename",
-                    "tokens.bin",
-                    "--dataset-id",
-                    "owner/dataset",
-                    "--num-rows",
-                    "0",
-                    "--type",
-                    "train",
-                ]
-            )
 
     def test_max_tokens_must_be_positive(self):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            preprocess.parse_args(
-                [
-                    "--filename",
-                    "tokens.bin",
-                    "--dataset-id",
-                    "owner/dataset",
-                    "--max_tokens",
-                    "0",
-                    "--type",
-                    "train",
-                ]
-            )
+            preprocess.parse_args(["train.bin", "val.bin", "--max_tokens", "0"])
 
-    def test_type_must_be_supported(self):
+    def test_both_output_paths_are_required(self):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            preprocess.parse_args(
-                [
-                    "--filename",
-                    "tokens.bin",
-                    "--dataset-id",
-                    "owner/dataset",
-                    "--type",
-                    "validation",
-                ]
-            )
+            preprocess.parse_args(["train.bin"])
 
-    @patch("data.preprocess.load_dataset")
-    def test_validation_split_and_optional_dataset_name(self, load_dataset):
-        preprocess.load_streaming_dataset("owner/dataset", "subset", "val")
+    @patch("pretraining.preprocess.load_dataset")
+    def test_loads_the_fineweb_10bt_sample(self, load_dataset):
+        preprocess.load_streaming_dataset()
         load_dataset.assert_called_once_with(
-            "owner/dataset", name="subset", split="validation", streaming=True
-        )
-
-        load_dataset.reset_mock()
-        preprocess.load_streaming_dataset("owner/dataset", None, "test")
-        load_dataset.assert_called_once_with(
-            "owner/dataset", split="test", streaming=True
+            "HuggingFaceFW/fineweb",
+            name="sample-10BT",
+            split="train",
+            streaming=True,
         )
 
     def test_processes_entire_dataset_and_reports_progress(self):
@@ -130,41 +84,6 @@ class PreprocessTests(unittest.TestCase):
         self.assertIn("Processed 1 rows", progress.getvalue())
         self.assertIn("Processed 2 rows", progress.getvalue())
         self.assertIn("Completed: wrote 3 rows and 7 tokens", progress.getvalue())
-
-    def test_limits_rows_and_reports_requested_total(self):
-        rows = [{"text": "a"}, {"text": "b"}, {"text": "c"}]
-        progress = StringIO()
-
-        with TemporaryDirectory() as directory:
-            filename = Path(directory) / "tokens.bin"
-            result = preprocess.preprocess_dataset(
-                rows,
-                filename,
-                FakeTokenizer(),
-                num_rows=2,
-                progress_stream=progress,
-            )
-            tokens = np.fromfile(filename, dtype=np.uint16).tolist()
-
-        self.assertEqual(result, (2, 4))
-        self.assertEqual(tokens, [97, 99, 98, 99])
-        self.assertIn("Processed 1/2 rows", progress.getvalue())
-
-    def test_writes_all_available_rows_when_limit_is_larger(self):
-        progress = StringIO()
-
-        with TemporaryDirectory() as directory:
-            filename = Path(directory) / "tokens.bin"
-            result = preprocess.preprocess_dataset(
-                [{"text": "a"}, {"text": "b"}],
-                filename,
-                FakeTokenizer(),
-                num_rows=10,
-                progress_stream=progress,
-            )
-
-        self.assertEqual(result, (2, 4))
-        self.assertIn("Completed: wrote 2 rows and 4 tokens", progress.getvalue())
 
     def test_limits_tokens_by_truncating_the_final_row(self):
         progress = StringIO()
@@ -233,14 +152,11 @@ class PreprocessTests(unittest.TestCase):
         self.assertIn("Processed 1 rows, 2 tokens", output)
         self.assertIn("Processed 2 rows, 4 tokens", output)
 
-    def test_resolve_total_rows_prefers_the_requested_row_limit(self):
-        self.assertEqual(preprocess.resolve_total_rows(FakeInfoDataset(500), 10), 10)
-
     def test_resolve_total_rows_reads_the_split_size(self):
-        self.assertEqual(preprocess.resolve_total_rows(FakeInfoDataset(500), None), 500)
+        self.assertEqual(preprocess.resolve_total_rows(FakeInfoDataset(500)), 500)
 
     def test_resolve_total_rows_is_none_when_unknown(self):
-        self.assertIsNone(preprocess.resolve_total_rows([{"text": "a"}], None))
+        self.assertIsNone(preprocess.resolve_total_rows([{"text": "a"}]))
 
     def test_reports_row_percentage_when_the_split_size_is_known(self):
         progress = StringIO()
@@ -254,6 +170,65 @@ class PreprocessTests(unittest.TestCase):
             )
 
         self.assertIn("Processed 1/200 rows (0.5%)", progress.getvalue())
+
+    def test_split_train_val_splits_ninety_ten(self):
+        with TemporaryDirectory() as directory:
+            train = Path(directory) / "train.bin"
+            val = Path(directory) / "val.bin"
+            original = list(range(100))
+            np.asarray(original, dtype=np.uint16).tofile(train)
+
+            result = preprocess.split_train_val(train, val, progress_stream=StringIO())
+
+            train_tokens = np.fromfile(train, dtype=np.uint16).tolist()
+            val_tokens = np.fromfile(val, dtype=np.uint16).tolist()
+
+        self.assertEqual(result, (90, 10))
+        # The train file is truncated in place and val holds the tail.
+        self.assertEqual(train_tokens, original[:90])
+        self.assertEqual(val_tokens, original[90:])
+        self.assertEqual(train_tokens + val_tokens, original)
+
+    def test_split_train_val_rounds_uneven_totals(self):
+        with TemporaryDirectory() as directory:
+            train = Path(directory) / "train.bin"
+            val = Path(directory) / "val.bin"
+            np.asarray(range(7), dtype=np.uint16).tofile(train)
+
+            # round(7 * 0.9) == 6
+            result = preprocess.split_train_val(train, val, progress_stream=StringIO())
+
+            train_tokens = np.fromfile(train, dtype=np.uint16).tolist()
+            val_tokens = np.fromfile(val, dtype=np.uint16).tolist()
+
+        self.assertEqual(result, (6, 1))
+        self.assertEqual(train_tokens, [0, 1, 2, 3, 4, 5])
+        self.assertEqual(val_tokens, [6])
+
+    def test_split_train_val_honours_a_custom_fraction(self):
+        with TemporaryDirectory() as directory:
+            train = Path(directory) / "train.bin"
+            val = Path(directory) / "val.bin"
+            np.asarray(range(10), dtype=np.uint16).tofile(train)
+
+            result = preprocess.split_train_val(
+                train, val, train_fraction=0.5, progress_stream=StringIO()
+            )
+
+            self.assertEqual(np.fromfile(val, dtype=np.uint16).tolist(), [5, 6, 7, 8, 9])
+
+        self.assertEqual(result, (5, 5))
+
+    def test_split_train_val_rejects_an_empty_token_file(self):
+        with TemporaryDirectory() as directory:
+            train = Path(directory) / "train.bin"
+            val = Path(directory) / "val.bin"
+            train.write_bytes(b"")
+
+            with self.assertRaisesRegex(ValueError, "empty"):
+                preprocess.split_train_val(train, val, progress_stream=StringIO())
+
+            self.assertFalse(val.exists())
 
     def test_rejects_missing_or_non_string_text(self):
         for row in ({"other": "value"}, {"text": None}):
