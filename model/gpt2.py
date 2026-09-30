@@ -13,6 +13,12 @@ class GPT2(nn.Module):
         self.weight_embedding = nn.Embedding(config.vocab_size, config.n_embed)
         self.pos_embedding = nn.Embedding(config.context_len, config.n_embed)
 
+        nn.init.normal_(
+            self.weight_embedding.weight,
+            mean=0.0,
+            std=0.02,
+        )
+        
         self.ln1 = nn.LayerNorm(self.config.n_embed)
         self.lm_head = nn.Linear(self.config.n_embed, self.config.vocab_size, bias=False)
         # share weights
