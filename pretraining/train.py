@@ -89,6 +89,9 @@ def train(config, dataset_path):
                 )
 
             loss.backward()
+
+            # clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             step += 1
@@ -97,6 +100,7 @@ def train(config, dataset_path):
             if step % config.log_interval == 0:
                 print(
                     f"Step {step:,}/{config.max_steps:,} | loss {loss_value:.4f} "
+                    f"| grad norm {grad_norm:.4f} "
                     f"| {now - step_started:.2f}s/step | {now - started:.0f}s elapsed"
                 )
             step_started = now
