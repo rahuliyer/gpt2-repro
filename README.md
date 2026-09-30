@@ -1,13 +1,13 @@
 # GPT-2 Reproduction
 
-A from-scratch implementation of the GPT-2 workflow, organized into:
+A from-scratch implementation of GPT-2 — model, tokenizer pipeline, and
+pretraining loop — written directly against PyTorch rather than using
+Transformers' training utilities.
 
-- `pretraining/` for language-model pretraining, plus the dataset acquisition
-  and preparation scripts it depends on
-- `classification/` for classification fine-tuning
-- `instruct/` for instruction fine-tuning
-
-Implement each workflow directly in its corresponding directory.
+- `model/` the GPT-2 architecture (`GPT2`, `TransformerBlock`, configs)
+- `pretraining/` dataset preparation and the pretraining loop
+- `classification/` classification fine-tuning
+- `instruct/` instruction fine-tuning
 
 ## Setup
 
@@ -17,21 +17,104 @@ Install the locked dependencies with [uv](https://docs.astral.sh/uv/):
 uv sync
 ```
 
-The environment includes PyTorch and NumPy, along with Hugging Face libraries
-for downloading GPT-2 weights, loading safetensors files, and accessing datasets
-such as FineWeb. The model and training implementations are left to this
-project rather than supplied by Transformers.
+## Prepare data
 
-## Decode token files
-
-Decode a raw `uint16` token file created by `pretraining/preprocess.py` to stdout:
+`pretraining/preprocess.py` streams the FineWeb-Edu `sample-10BT` config,
+tokenizes it with the GPT-2 BPE vocabulary, and writes raw `uint16` token
+files — one for training, one for validation:
 
 ```bash
-python pretraining/decode.py --input tokens.bin
+uv run python pretraining/preprocess.py \
+    datasets/fineweb/train.bin \
+    datasets/fineweb/val.bin
 ```
 
-Pass an optional output path to write the decoded text to a file instead:
+Validation takes 10% of the tokens, capped at 50M so a full-sample run does
+not spend ~1B tokens on validation; everything above the cap stays in train.
+Pass `--max-tokens` to process only part of the sample, which is much faster
+for a smoke test:
 
 ```bash
-python pretraining/decode.py --input tokens.bin --output decoded.txt
+uv run python pretraining/preprocess.py \
+    datasets/fineweb/train.bin \
+    datasets/fineweb/val.bin \
+    --max-tokens 2000000
 ```
+
+Tokenizing the full 10BT sample produces roughly 20GB of `.bin` output, so
+budget disk accordingly. The `datasets/` directory is gitignored.
+
+## Pretrain
+
+```bash
+uv run python pretraining/train.py \
+    datasets/fineweb/train.bin \
+    datasets/fineweb/val.bin \
+    checkpoints/gpt2.safetensors
+```
+
+Hyperparameters live in the `TrainingConfig` dataclass at the top of
+`pretraining/train.py` — edit them there rather than passing flags. The
+defaults follow the GPT-2 paper: AdamW at 6e-4 with betas (0.9, 0.95) and
+0.1 weight decay, gradient clipping at 1.0, 100 warmup steps, and a cosine
+decay to 6e-5.
+
+### Effective batch size
+
+`total_batch_size` is a **token budget per optimizer step** (524,288 = 2^19,
+the GPT-2 paper's ~0.5M). The number of gradient accumulation steps is
+derived from it:
+
+```
+grad_accum_steps = total_batch_size // (batch_size * context_len)
+```
+
+So `batch_size` is purely a memory knob — raise it on a larger GPU and the
+accumulation count drops automatically while the effective batch, and
+therefore the learning-rate schedule, stays valid. `total_batch_size` must be
+divisible by `batch_size * context_len` or startup fails with an error.
+
+Each accumulation cycle scales its loss by `1 / grad_accum_steps` before
+`backward()`, so the accumulated gradient is the mean over the cycle rather
+than the sum. Gradients are clipped once per optimizer step, after the full
+cycle has accumulated.
+
+### Precision
+
+Training uses bf16 autocast when the GPU supports it natively, and falls back
+to fp32 otherwise. The check deliberately passes `including_emulation=False`:
+`torch.cuda.is_bf16_supported()` returns `True` by default on cards that only
+emulate bf16 in software (Turing and earlier), which would train through a
+slow path with no tensor-core benefit. The startup line reports which mode is
+active.
+
+### Logging
+
+Every step logs loss, learning rate, pre-clip gradient norm, throughput, and
+timing. Validation runs a full pass over the validation file every
+`eval_interval` steps — note this scales with validation size, so raise
+`eval_interval` or lower `VAL_TOKEN_CAP` if evaluation starts to dominate.
+
+Runs are tracked in Weights & Biases under the `wandb_project` name.
+`wandb.init()` happens in `main()`, and the training loop only logs when a run
+is active, so importing and calling `train()` directly from a script or test
+never starts a tracked run. Set `WANDB_MODE=disabled` or `offline` to turn
+tracking off without touching code.
+
+## Inspect token files
+
+Decode a raw `uint16` token file back to text:
+
+```bash
+uv run python pretraining/decode.py --input datasets/fineweb/val.bin
+uv run python pretraining/decode.py --input datasets/fineweb/val.bin --output decoded.txt
+```
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+`tests/test_eqv.py` checks this implementation against Hugging Face's
+`GPT2LMHeadModel` and needs to download the pretrained weights.
