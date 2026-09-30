@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import time
 
@@ -16,9 +17,11 @@ from model import GPT2, GPT2SmallConfig
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 2
+    batch_size: int = 4
     context_len: int = 1024
-    learning_rate: float = 6e-4
+    max_lr: float = 6e-4
+    min_lr: float = 6e-5
+    warmup_steps: int = 100
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.1
     dropout: float = 0.0
@@ -27,6 +30,17 @@ class TrainingConfig:
     num_workers: int = 1
     seed: int = 1337
     log_interval: int = 1
+
+
+def get_lr(step, config):
+    """Cosine learning rate schedule with linear warmup."""
+    if step < config.warmup_steps:
+        return config.max_lr * (step + 1) / config.warmup_steps
+    if step >= config.max_steps:
+        return config.min_lr
+    decay_ratio = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return config.min_lr + coeff * (config.max_lr - config.min_lr)
 
 
 def train(config, dataset_path):
@@ -43,7 +57,7 @@ def train(config, dataset_path):
     ).to(device)
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=config.learning_rate,
+        lr=config.max_lr,
         betas=config.betas,
         weight_decay=config.weight_decay,
     )
@@ -92,6 +106,11 @@ def train(config, dataset_path):
 
             # clip gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            lr = get_lr(step, config)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
             optimizer.step()
 
             step += 1
@@ -100,7 +119,7 @@ def train(config, dataset_path):
             if step % config.log_interval == 0:
                 print(
                     f"Step {step:,}/{config.max_steps:,} | loss {loss_value:.4f} "
-                    f"| grad norm {grad_norm:.4f} "
+                    f"| lr {lr:.2e} | grad norm {grad_norm:.4f} "
                     f"| {now - step_started:.2f}s/step | {now - started:.0f}s elapsed"
                 )
             step_started = now
