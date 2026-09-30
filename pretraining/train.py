@@ -33,6 +33,10 @@ def train(config, dataset_path):
     """Train a model on the tokenized dataset and return it with the final loss."""
     torch.manual_seed(config.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # including_emulation=False: is_bf16_supported() defaults to True on GPUs
+    # (e.g. Turing) that only emulate bf16 in software, with no tensor-core
+    # speedup, so require native hardware support instead.
+    use_bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
 
     model = GPT2(
         GPT2SmallConfig(context_len=config.context_len, dropout=config.dropout)
@@ -54,7 +58,11 @@ def train(config, dataset_path):
         shuffle=False,
         num_workers=config.num_workers,
     )
-    print(f"Training on {device} | {len(dataset):,} examples | {config.max_steps:,} steps max")
+    precision = "bf16 (autocast)" if use_bf16 else "fp32"
+    print(
+        f"Training on {device} | {precision} | {len(dataset):,} examples "
+        f"| {config.max_steps:,} steps max"
+    )
 
     model.train()
     step = 0
@@ -69,11 +77,16 @@ def train(config, dataset_path):
 
             optimizer.zero_grad()
 
-            logits = compiled_model(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                y.reshape(-1),
-            )
+            with torch.autocast(
+                "cuda",
+                dtype=torch.bfloat16,
+                enabled=use_bf16
+            ):
+                logits = compiled_model(x)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    y.reshape(-1),
+                )
 
             loss.backward()
             optimizer.step()
