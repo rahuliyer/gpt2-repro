@@ -12,10 +12,11 @@ import numpy as np
 import tiktoken
 
 
-DATASET_ID = "HuggingFaceFW/fineweb"
+DATASET_ID = "HuggingFaceFW/fineweb-edu"
 DATASET_NAME = "sample-10BT"
 DATASET_SPLIT = "train"
 TRAIN_FRACTION = 0.9
+VAL_TOKEN_CAP = 50_000_000  # 10% of the full sample would be ~1B, which is wasteful
 TOKEN_BYTES = 2  # uint16
 
 PROGRESS_INTERVAL = 1_000
@@ -187,32 +188,48 @@ def split_train_val(
     train_filename,
     val_filename,
     train_fraction=TRAIN_FRACTION,
+    val_token_cap=VAL_TOKEN_CAP,
     *,
     progress_stream=sys.stderr,
 ):
     """Carve the tail off a token file into a separate validation file.
 
-    The train file is written first as one contiguous stream; this moves the
-    last ``1 - train_fraction`` of it into ``val_filename`` and truncates the
-    train file in place, so only the validation tokens are ever copied.
-    """
-    tokens = np.memmap(train_filename, dtype=np.uint16, mode="r")
-    total_tokens = len(tokens)
-    if total_tokens == 0:
-        del tokens
-        raise ValueError(f"{train_filename} is empty, nothing to split")
+    Validation takes ``1 - train_fraction`` of the tokens, capped at
+    ``val_token_cap`` so a full-sample run does not spend ~1B tokens on
+    validation. Everything above the cap stays in train.
 
+    The train file is written first as one contiguous stream; this moves the
+    tail into ``val_filename`` and truncates the train file in place, so only
+    the validation tokens are ever copied.
+    """
+    # Check the size up front: np.memmap raises on an empty file, so the
+    # guard has to run before the mapping is created.
+    total_tokens = os.path.getsize(train_filename) // TOKEN_BYTES
+    if total_tokens < 2:
+        raise ValueError(
+            f"{train_filename} holds {total_tokens} tokens, too few to split"
+        )
+
+    tokens = np.memmap(train_filename, dtype=np.uint16, mode="r")
     split_index = round(total_tokens * train_fraction)
+    val_tokens = total_tokens - split_index
+    capped = val_tokens > val_token_cap
+    if capped:
+        val_tokens = val_token_cap
+        split_index = total_tokens - val_tokens
+    val_tokens = max(1, val_tokens)
+    split_index = total_tokens - val_tokens
+
     tokens[split_index:].tofile(val_filename)
     # Release the mapping before resizing the file underneath it.
     del tokens
     os.truncate(train_filename, split_index * TOKEN_BYTES)
 
-    val_tokens = total_tokens - split_index
+    reason = f" (capped at {val_token_cap:,})" if capped else ""
     print(
         f"Split {total_tokens:,} tokens: {split_index:,} train "
         f"({100 * split_index / total_tokens:.1f}%) -> {train_filename}, "
-        f"{val_tokens:,} val -> {val_filename}",
+        f"{val_tokens:,} val{reason} -> {val_filename}",
         file=progress_stream,
         flush=True,
     )

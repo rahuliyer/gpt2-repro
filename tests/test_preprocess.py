@@ -55,14 +55,15 @@ class PreprocessTests(unittest.TestCase):
             preprocess.parse_args(["train.bin"])
 
     @patch("pretraining.preprocess.load_dataset")
-    def test_loads_the_fineweb_10bt_sample(self, load_dataset):
+    def test_loads_the_configured_fineweb_sample(self, load_dataset):
         preprocess.load_streaming_dataset()
         load_dataset.assert_called_once_with(
-            "HuggingFaceFW/fineweb",
-            name="sample-10BT",
-            split="train",
+            preprocess.DATASET_ID,
+            name=preprocess.DATASET_NAME,
+            split=preprocess.DATASET_SPLIT,
             streaming=True,
         )
+        self.assertEqual(preprocess.DATASET_NAME, "sample-10BT")
 
     def test_processes_entire_dataset_and_reports_progress(self):
         rows = [{"text": "a"}, {"text": "bc"}, {"text": "d"}]
@@ -205,6 +206,38 @@ class PreprocessTests(unittest.TestCase):
         self.assertEqual(train_tokens, [0, 1, 2, 3, 4, 5])
         self.assertEqual(val_tokens, [6])
 
+    def test_split_train_val_caps_the_validation_size(self):
+        with TemporaryDirectory() as directory:
+            train = Path(directory) / "train.bin"
+            val = Path(directory) / "val.bin"
+            np.asarray(range(100), dtype=np.uint16).tofile(train)
+
+            # 10% would be 10 tokens; the cap pulls it down to 3.
+            result = preprocess.split_train_val(
+                train, val, val_token_cap=3, progress_stream=StringIO()
+            )
+
+            train_tokens = np.fromfile(train, dtype=np.uint16).tolist()
+            val_tokens = np.fromfile(val, dtype=np.uint16).tolist()
+
+        self.assertEqual(result, (97, 3))
+        self.assertEqual(val_tokens, [97, 98, 99])
+        # Tokens above the cap stay in train rather than being dropped.
+        self.assertEqual(len(train_tokens) + len(val_tokens), 100)
+
+    def test_split_train_val_ignores_a_cap_above_the_fraction(self):
+        with TemporaryDirectory() as directory:
+            train = Path(directory) / "train.bin"
+            val = Path(directory) / "val.bin"
+            np.asarray(range(100), dtype=np.uint16).tofile(train)
+
+            # 10% is 10 tokens, well under the cap, so the fraction wins.
+            result = preprocess.split_train_val(
+                train, val, val_token_cap=1_000, progress_stream=StringIO()
+            )
+
+        self.assertEqual(result, (90, 10))
+
     def test_split_train_val_honours_a_custom_fraction(self):
         with TemporaryDirectory() as directory:
             train = Path(directory) / "train.bin"
@@ -219,13 +252,13 @@ class PreprocessTests(unittest.TestCase):
 
         self.assertEqual(result, (5, 5))
 
-    def test_split_train_val_rejects_an_empty_token_file(self):
+    def test_split_train_val_rejects_a_too_small_token_file(self):
         with TemporaryDirectory() as directory:
             train = Path(directory) / "train.bin"
             val = Path(directory) / "val.bin"
             train.write_bytes(b"")
 
-            with self.assertRaisesRegex(ValueError, "empty"):
+            with self.assertRaisesRegex(ValueError, "too few"):
                 preprocess.split_train_val(train, val, progress_stream=StringIO())
 
             self.assertFalse(val.exists())
