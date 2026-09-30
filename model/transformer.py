@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class TransformerBlock(nn.Module):
     def __init__(self, config):
@@ -52,13 +53,23 @@ class TransformerBlock(nn.Module):
         k = k.transpose(1, 2) # B x H x T x head_size
         v = v.transpose(1, 2) # B x H x T x head_size
 
-        attn_matrix = (q @ k.transpose(-1, -2) / math.sqrt(self.config.d_model // self.config.n_heads)) # B x H x T x T
-        mask = torch.tril(torch.ones(x.shape[1], x.shape[1], device=x.device)) # B x H x T x T
-        attn_mask = attn_matrix.masked_fill(mask == 0, float('-inf')) # B x H x T x T
-        attn_weights = torch.softmax(attn_mask, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        #attn_matrix = (q @ k.transpose(-1, -2) / math.sqrt(self.config.d_model // self.config.n_heads)) # B x H x T x T
+        #mask = torch.tril(torch.ones(x.shape[1], x.shape[1], device=x.device)) # B x H x T x T
+        #attn_mask = attn_matrix.masked_fill(mask == 0, float('-inf')) # B x H x T x T
+        #attn_weights = torch.softmax(attn_mask, dim=-1)
+        #attn_weights = self.dropout(attn_weights)
 
-        res = attn_weights @ v # B x H x T x head_size
+        #res = attn_weights @ v # B x H x T x head_size
+
+        # Use scaled dot product attention
+        res = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.config.dropout if self.training else 0.0,
+            is_causal=True,
+        )
+
         res = res.transpose(1, 2) # B x T x H x head_size
         res = res.reshape(x.shape[0], x.shape[1], self.config.d_model) # B x T x d_model
         res = self.attn_proj(res) # B x T x n_embed
