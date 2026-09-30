@@ -1,6 +1,7 @@
 from model.transformer import TransformerBlock
 import torch
 import torch.nn as nn
+import math
 
 from safetensors.torch import save_model, load_model
 
@@ -21,14 +22,58 @@ class GPT2(nn.Module):
         
         self.ln1 = nn.LayerNorm(self.config.n_embed)
         self.lm_head = nn.Linear(self.config.n_embed, self.config.vocab_size, bias=False)
-        # share weights
-        self.lm_head.weight = self.weight_embedding.weight
 
         self.dropout = nn.Dropout(self.config.dropout)
 
         self.transformers = nn.ModuleList([
             TransformerBlock(self.config) for _ in range(self.config.n_layers)
         ])
+
+        self._init_weights()
+
+        # share weights
+        self.lm_head.weight = self.weight_embedding.weight
+
+
+    def _init_weights(self):
+        # normal GPT-2 initialization
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                torch.nn.init.normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=0.02,
+                )
+
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=0.02,
+                )
+
+            elif isinstance(module, nn.LayerNorm):
+                torch.nn.init.ones_(module.weight)
+                torch.nn.init.zeros_(module.bias)
+
+        # special residual-path initialization
+        residual_std = 0.02 / math.sqrt(2 * self.config.n_layers)
+
+        for block in self.transformers:
+            torch.nn.init.normal_(
+                block.attn_proj.weight,
+                mean=0.0,
+                std=residual_std,
+            )
+
+            torch.nn.init.normal_(
+                block.ffwd[2].weight,
+                mean=0.0,
+                std=residual_std,
+            )
 
     def forward(self, x):
         emb = (self.weight_embedding(x) + 
