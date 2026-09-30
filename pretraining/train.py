@@ -131,8 +131,22 @@ def build_dataloader(dataset_path, config, offset=0):
         sampler=OffsetSampler(len(dataset), offset),
         num_workers=config.num_workers,
         persistent_workers=config.num_workers > 0,
+        # A short final batch would change the input shape, forcing
+        # torch.compile to recompile, and would carry the same weight as a
+        # full one in both the accumulated gradient and the eval average.
+        drop_last=True,
     )
+    if len(dataloader) == 0:
+        raise ValueError(
+            f"{dataset_path} holds {len(dataset)} examples of {config.context_len} "
+            f"tokens, fewer than one batch of {config.batch_size}"
+        )
     return dataset, dataloader
+
+
+def usable_examples(dataset_length, batch_size):
+    """Examples actually yielded per pass once the short final batch is dropped."""
+    return (dataset_length // batch_size) * batch_size
 
 
 # Changing any of these invalidates the restored step counter, so a resume
@@ -321,7 +335,11 @@ def train(config, train_path, val_path, run_dir, state=None):
     # Peek at the dataset length to turn examples consumed into an offset,
     # then build the loader once with that offset already applied.
     probe = FineWebDataset(str(train_path), config.context_len)
-    offset = examples_consumed % len(probe) if len(probe) else 0
+    # Modulo the examples actually yielded per pass, not the dataset length:
+    # drop_last means each pass is short by len(dataset) % batch_size, and
+    # using the raw length would drift by that much on every wrap.
+    per_pass = usable_examples(len(probe), config.batch_size)
+    offset = examples_consumed % per_pass if per_pass else 0
     del probe
     dataset, dataloader = build_dataloader(train_path, config, offset=offset)
     # Validation always scores the same prefix, so it never takes an offset.

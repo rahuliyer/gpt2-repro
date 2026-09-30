@@ -171,6 +171,18 @@ class PruneCheckpointsTests(unittest.TestCase):
             self.assertEqual(train.prune_checkpoints(run, 3), [])
 
 
+class UsableExamplesTests(unittest.TestCase):
+    def test_rounds_down_to_whole_batches(self):
+        # 7 examples at batch 4 yields one batch; the last 3 are dropped.
+        self.assertEqual(train.usable_examples(7, 4), 4)
+
+    def test_exact_multiple_keeps_everything(self):
+        self.assertEqual(train.usable_examples(8, 4), 8)
+
+    def test_fewer_examples_than_a_batch_yields_none(self):
+        self.assertEqual(train.usable_examples(3, 4), 0)
+
+
 class ResumeConfigTests(unittest.TestCase):
     def test_accepts_an_identical_config(self):
         config = train.TrainingConfig()
