@@ -41,6 +41,22 @@ uv run python pretraining/preprocess.py \
     --max-tokens 2000000
 ```
 
+A full run takes a while, so progress is checkpointed once a minute to
+`<train file>.ckpt.json` (here `datasets/fineweb/train.bin.ckpt.json`). If the
+run is interrupted, repeat the same command with `--resume` to continue from
+the last checkpoint instead of starting over:
+
+```bash
+uv run python pretraining/preprocess.py \
+    datasets/fineweb/train.bin \
+    datasets/fineweb/val.bin \
+    --resume
+```
+
+`--max-tokens` must match the interrupted run. The checkpoint is deleted once
+both files are finished; without `--resume` an existing checkpoint is ignored
+and the run starts from the beginning.
+
 Tokenizing the full 10BT sample produces roughly 20GB of `.bin` output, so
 budget disk accordingly. The `datasets/` directory is gitignored.
 

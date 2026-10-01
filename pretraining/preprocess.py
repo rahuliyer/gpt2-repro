@@ -2,6 +2,8 @@
 
 import argparse
 from collections.abc import Mapping
+from itertools import islice
+import json
 import os
 from pathlib import Path
 import sys
@@ -15,6 +17,7 @@ import tiktoken
 DATASET_ID = "HuggingFaceFW/fineweb-edu"
 DATASET_NAME = "sample-10BT"
 DATASET_SPLIT = "train"
+DATASET_SOURCE = f"{DATASET_ID}/{DATASET_NAME}/{DATASET_SPLIT}"
 TRAIN_FRACTION = 0.9
 VAL_TOKEN_CAP = 50_000_000  # 10% of the full sample would be ~1B, which is wasteful
 TOKEN_BYTES = 2  # uint16
@@ -22,6 +25,9 @@ TOKEN_BYTES = 2  # uint16
 PROGRESS_INTERVAL = 1_000
 PROGRESS_UPDATES = 100
 PROGRESS_SECONDS = 30
+
+CHECKPOINT_SUFFIX = ".ckpt.json"
+CHECKPOINT_SECONDS = 60
 
 
 def positive_int(value):
@@ -53,6 +59,11 @@ def parse_args(argv=None):
         type=positive_int,
         help="Total tokens to write across both files; omitted means the whole sample.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue an interrupted run from the checkpoint beside train_filename.",
+    )
     return parser.parse_args(argv)
 
 
@@ -76,8 +87,79 @@ def resolve_total_rows(dataset):
     return totals[0] if len(totals) == 1 else None
 
 
+def checkpoint_path(train_filename):
+    """Return where the checkpoint for a given training token file lives."""
+    return train_filename.with_name(train_filename.name + CHECKPOINT_SUFFIX)
+
+
+def save_checkpoint(path, checkpoint):
+    """Write a checkpoint atomically, so a crash never leaves a torn one."""
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w") as output:
+        json.dump(checkpoint, output)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
+def load_checkpoint(path):
+    """Read a checkpoint written by `save_checkpoint`."""
+    with path.open() as source:
+        return json.load(source)
+
+
+def check_resume_checkpoint(checkpoint, max_tokens):
+    """Raise when a checkpoint was written by a run with different settings."""
+    current = {"dataset": DATASET_SOURCE, "max_tokens": max_tokens}
+    conflicts = [
+        f"{field}: checkpoint has {checkpoint[field]!r}, this run has {value!r}"
+        for field, value in current.items()
+        if checkpoint[field] != value
+    ]
+    if conflicts:
+        raise ValueError(
+            "cannot resume, these settings must match the checkpoint:\n  "
+            + "\n  ".join(conflicts)
+        )
+
+
+def resume_rows(dataset, checkpoint):
+    """Return an iterator over the rows after the last checkpointed one."""
+    state = checkpoint["dataset_state"]
+    if state is not None and hasattr(dataset, "load_state_dict"):
+        # Jumps straight to the right shard instead of re-reading the stream.
+        dataset.load_state_dict(state)
+        return iter(dataset)
+    return islice(dataset, checkpoint["rows"], None)
+
+
+def open_output(filename, token_count):
+    """Open the token file positioned after its first `token_count` tokens."""
+    if token_count == 0:
+        return filename.open("wb")
+
+    expected_bytes = token_count * TOKEN_BYTES
+    actual_bytes = filename.stat().st_size
+    if actual_bytes < expected_bytes:
+        raise ValueError(
+            f"cannot resume, {filename} holds {actual_bytes // TOKEN_BYTES:,} tokens"
+            f" but the checkpoint expects {token_count:,}"
+        )
+    output = filename.open("r+b")
+    # Anything past the checkpoint was written after it and will be redone.
+    output.truncate(expected_bytes)
+    output.seek(expected_bytes)
+    return output
+
+
 def report_progress(
-    progress_stream, row_count, token_count, total_rows, max_tokens, elapsed
+    progress_stream,
+    row_count,
+    token_count,
+    total_rows,
+    max_tokens,
+    elapsed,
+    resumed_tokens=0,
 ):
     """Print one progress line, with a percentage when a total is known."""
     if max_tokens is not None:
@@ -96,7 +178,7 @@ def report_progress(
         headline = f"Processed {row_count:,} rows"
         detail = f"{token_count:,} tokens"
 
-    rate = token_count / elapsed if elapsed > 0 else 0
+    rate = (token_count - resumed_tokens) / elapsed if elapsed > 0 else 0
     print(
         f"{headline}, {detail}, {elapsed:.0f}s elapsed, {rate:,.0f} tok/s",
         file=progress_stream,
@@ -110,23 +192,65 @@ def preprocess_dataset(
     tokenizer,
     max_tokens=None,
     *,
+    checkpoint_filename=None,
+    resume_from=None,
+    checkpoint_seconds=CHECKPOINT_SECONDS,
     progress_stream=sys.stderr,
     progress_interval=PROGRESS_INTERVAL,
 ):
-    """Tokenize dataset rows and return the numbers of rows and tokens written."""
+    """Tokenize dataset rows and return the numbers of rows and tokens written.
+
+    With ``checkpoint_filename`` set, progress is saved there every
+    ``checkpoint_seconds``. Passing a loaded checkpoint as ``resume_from``
+    continues from it; the returned counts then cover the whole file, not just
+    this call.
+    """
     total_rows = resolve_total_rows(dataset)
-    rows = iter(dataset)
-    row_count = 0
-    token_count = 0
+    if resume_from is None:
+        rows = iter(dataset)
+        row_count = 0
+        token_count = 0
+    else:
+        rows = resume_rows(dataset, resume_from)
+        row_count = resume_from["rows"]
+        token_count = resume_from["tokens"]
+        print(
+            f"Resuming after {row_count:,} rows and {token_count:,} tokens",
+            file=progress_stream,
+            flush=True,
+        )
+    resumed_rows = row_count
+    resumed_tokens = token_count
     started = time.monotonic()
     last_report = started
+    last_checkpoint = started
     reported_milestone = 0
+
+    def write_checkpoint(output, complete=False):
+        if checkpoint_filename is None:
+            return
+        # The tokens have to be durable before a checkpoint may count them.
+        output.flush()
+        os.fsync(output.fileno())
+        state_dict = getattr(dataset, "state_dict", None)
+        save_checkpoint(
+            checkpoint_filename,
+            {
+                "dataset": DATASET_SOURCE,
+                "max_tokens": max_tokens,
+                "rows": row_count,
+                "tokens": token_count,
+                "complete": complete,
+                "dataset_state": state_dict() if state_dict is not None else None,
+            },
+        )
 
     # Aim for roughly PROGRESS_UPDATES lines whenever a total is known, and
     # fall back to a fixed row interval when the split size is unknown.
     if max_tokens is not None:
         token_interval = max(1, max_tokens // PROGRESS_UPDATES)
         row_interval = None
+        reported_milestone = token_count // token_interval
     elif total_rows is not None:
         token_interval = None
         row_interval = max(1, total_rows // PROGRESS_UPDATES)
@@ -134,8 +258,11 @@ def preprocess_dataset(
         token_interval = None
         row_interval = progress_interval
 
-    with filename.open("wb") as output:
-        for row_number, row in enumerate(rows, start=1):
+    with open_output(filename, token_count) as output:
+        if resume_from is None:
+            # A checkpoint left by an earlier run no longer describes this file.
+            write_checkpoint(output)
+        for row_number, row in enumerate(rows, start=row_count + 1):
             if not isinstance(row, Mapping) or "text" not in row:
                 raise ValueError(f"row {row_number} does not contain a 'text' field")
 
@@ -165,7 +292,8 @@ def preprocess_dataset(
 
             now = time.monotonic()
             # Report on a timer too, so a slow stream never looks hung.
-            if row_count == 1 or due or now - last_report >= PROGRESS_SECONDS:
+            first_row = row_count == resumed_rows + 1
+            if first_row or due or now - last_report >= PROGRESS_SECONDS:
                 last_report = now
                 report_progress(
                     progress_stream,
@@ -174,10 +302,17 @@ def preprocess_dataset(
                     total_rows,
                     max_tokens,
                     now - started,
+                    resumed_tokens,
                 )
+
+            if now - last_checkpoint >= checkpoint_seconds:
+                last_checkpoint = now
+                write_checkpoint(output)
 
             if max_tokens is not None and token_count >= max_tokens:
                 break
+
+        write_checkpoint(output, complete=True)
 
     print(
         f"Completed: wrote {row_count} rows and {token_count} tokens to {filename}"
@@ -242,24 +377,59 @@ def split_train_val(
 
 def main(argv=None):
     args = parse_args(argv)
+    checkpoint_filename = checkpoint_path(args.train_filename)
 
+    checkpoint = None
     try:
-        dataset = load_streaming_dataset()
-    except Exception as exc:
-        print(f"error: failed to load dataset: {exc}", file=sys.stderr)
+        if args.resume:
+            if not checkpoint_filename.exists():
+                print(
+                    f"error: --resume found no checkpoint at {checkpoint_filename}",
+                    file=sys.stderr,
+                )
+                return 1
+            checkpoint = load_checkpoint(checkpoint_filename)
+            check_resume_checkpoint(checkpoint, args.max_tokens)
+        elif checkpoint_filename.exists():
+            print(
+                f"warning: starting over, ignoring the checkpoint at"
+                f" {checkpoint_filename} (pass --resume to continue it)",
+                file=sys.stderr,
+            )
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    tokenized = checkpoint is not None and checkpoint["complete"]
+    if not tokenized:
+        try:
+            dataset = load_streaming_dataset()
+        except Exception as exc:
+            print(f"error: failed to load dataset: {exc}", file=sys.stderr)
+            return 1
+
     try:
-        tokenizer = tiktoken.get_encoding("gpt2")
         args.train_filename.parent.mkdir(parents=True, exist_ok=True)
         args.val_filename.parent.mkdir(parents=True, exist_ok=True)
-        preprocess_dataset(
-            dataset,
-            args.train_filename,
-            tokenizer,
-            args.max_tokens,
-        )
-        split_train_val(args.train_filename, args.val_filename)
+        if not tokenized:
+            tokenizer = tiktoken.get_encoding("gpt2")
+            _, token_count = preprocess_dataset(
+                dataset,
+                args.train_filename,
+                tokenizer,
+                args.max_tokens,
+                checkpoint_filename=checkpoint_filename,
+                resume_from=checkpoint,
+            )
+        else:
+            token_count = checkpoint["tokens"]
+
+        # The split shrinks the train file as its last step, so a train file
+        # already below the tokenized size means an earlier run finished it.
+        train_bytes = args.train_filename.stat().st_size
+        if train_bytes >= token_count * TOKEN_BYTES:
+            split_train_val(args.train_filename, args.val_filename)
+        checkpoint_filename.unlink()
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

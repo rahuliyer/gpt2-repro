@@ -1,5 +1,6 @@
 from contextlib import redirect_stderr
 from io import StringIO
+from itertools import count
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -38,6 +39,27 @@ class FakeInfoDataset:
 
     def __iter__(self):
         return iter(self._rows)
+
+
+class FakeStatefulDataset:
+    """A streaming-like dataset that can save and restore its position."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+        self._position = 0
+        self.rows_read = 0
+
+    def __iter__(self):
+        while self._position < len(self._rows):
+            self._position += 1
+            self.rows_read += 1
+            yield self._rows[self._position - 1]
+
+    def state_dict(self):
+        return {"position": self._position}
+
+    def load_state_dict(self, state):
+        self._position = state["position"]
 
 
 class PreprocessTests(unittest.TestCase):
@@ -301,6 +323,295 @@ class PreprocessTests(unittest.TestCase):
                         FakeTokenizer(),
                         progress_stream=StringIO(),
                     )
+
+    def test_resume_is_off_by_default(self):
+        self.assertFalse(preprocess.parse_args(["train.bin", "val.bin"]).resume)
+        self.assertTrue(
+            preprocess.parse_args(["train.bin", "val.bin", "--resume"]).resume
+        )
+
+    def test_checkpoint_sits_beside_the_train_file(self):
+        self.assertEqual(
+            preprocess.checkpoint_path(Path("data/train.bin")),
+            Path("data/train.bin.ckpt.json"),
+        )
+
+    def test_writes_a_checkpoint_while_processing(self):
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            checkpoint_filename = preprocess.checkpoint_path(filename)
+            # The bad third row stops the run with two rows on disk.
+            with self.assertRaises(ValueError):
+                preprocess.preprocess_dataset(
+                    [{"text": "a"}, {"text": "bc"}, {"text": None}],
+                    filename,
+                    FakeTokenizer(),
+                    checkpoint_filename=checkpoint_filename,
+                    checkpoint_seconds=0,
+                    progress_stream=StringIO(),
+                )
+            checkpoint = preprocess.load_checkpoint(checkpoint_filename)
+            leftovers = [path.name for path in Path(directory).glob("*.tmp")]
+
+        self.assertEqual(checkpoint["rows"], 2)
+        self.assertEqual(checkpoint["tokens"], 5)
+        self.assertFalse(checkpoint["complete"])
+        self.assertEqual(checkpoint["dataset"], preprocess.DATASET_SOURCE)
+        self.assertEqual(leftovers, [])
+
+    def test_marks_the_checkpoint_complete_when_the_dataset_ends(self):
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            checkpoint_filename = preprocess.checkpoint_path(filename)
+            preprocess.preprocess_dataset(
+                [{"text": "a"}, {"text": "bc"}],
+                filename,
+                FakeTokenizer(),
+                checkpoint_filename=checkpoint_filename,
+                progress_stream=StringIO(),
+            )
+            checkpoint = preprocess.load_checkpoint(checkpoint_filename)
+
+        self.assertTrue(checkpoint["complete"])
+        self.assertEqual((checkpoint["rows"], checkpoint["tokens"]), (2, 5))
+
+    def test_resume_matches_an_uninterrupted_run(self):
+        rows = [{"text": "a"}, {"text": "bc"}, {"text": "d"}, {"text": "ef"}]
+        progress = StringIO()
+
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            checkpoint_filename = preprocess.checkpoint_path(filename)
+            with self.assertRaises(ValueError):
+                preprocess.preprocess_dataset(
+                    rows[:2] + [{"text": None}],
+                    filename,
+                    FakeTokenizer(),
+                    checkpoint_filename=checkpoint_filename,
+                    checkpoint_seconds=0,
+                    progress_stream=StringIO(),
+                )
+            # Tokens that reached the file after the last checkpoint.
+            with filename.open("ab") as output:
+                output.write(b"\x01\x00\x02\x00")
+
+            result = preprocess.preprocess_dataset(
+                rows,
+                filename,
+                FakeTokenizer(),
+                checkpoint_filename=checkpoint_filename,
+                resume_from=preprocess.load_checkpoint(checkpoint_filename),
+                progress_stream=progress,
+            )
+            tokens = np.fromfile(filename, dtype=np.uint16).tolist()
+
+        self.assertEqual(result, (4, 10))
+        self.assertEqual(tokens, [97, 99, 98, 99, 99, 100, 99, 101, 102, 99])
+        self.assertIn("Resuming after 2 rows and 5 tokens", progress.getvalue())
+        self.assertIn("Processed 3 rows", progress.getvalue())
+
+    def test_resume_restores_the_dataset_position_when_it_can(self):
+        rows = [{"text": "a"}, {"text": "bc"}, {"text": "d"}]
+
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            checkpoint_filename = preprocess.checkpoint_path(filename)
+            with self.assertRaises(ValueError):
+                preprocess.preprocess_dataset(
+                    FakeStatefulDataset(rows[:2] + [{"text": None}]),
+                    filename,
+                    FakeTokenizer(),
+                    checkpoint_filename=checkpoint_filename,
+                    checkpoint_seconds=0,
+                    progress_stream=StringIO(),
+                )
+            checkpoint = preprocess.load_checkpoint(checkpoint_filename)
+
+            dataset = FakeStatefulDataset(rows)
+            result = preprocess.preprocess_dataset(
+                dataset,
+                filename,
+                FakeTokenizer(),
+                checkpoint_filename=checkpoint_filename,
+                resume_from=checkpoint,
+                progress_stream=StringIO(),
+            )
+            tokens = np.fromfile(filename, dtype=np.uint16).tolist()
+
+        self.assertEqual(checkpoint["dataset_state"], {"position": 2})
+        self.assertEqual(result, (3, 7))
+        self.assertEqual(tokens, [97, 99, 98, 99, 99, 100, 99])
+        # Only the unfinished row is read; the first two are never revisited.
+        self.assertEqual(dataset.rows_read, 1)
+
+    def test_resume_honours_the_token_limit(self):
+        rows = [{"text": "ab"}, {"text": "de"}, {"text": "f"}]
+
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            checkpoint_filename = preprocess.checkpoint_path(filename)
+            with self.assertRaises(ValueError):
+                preprocess.preprocess_dataset(
+                    rows[:1] + [{"text": None}],
+                    filename,
+                    FakeTokenizer(),
+                    max_tokens=5,
+                    checkpoint_filename=checkpoint_filename,
+                    checkpoint_seconds=0,
+                    progress_stream=StringIO(),
+                )
+
+            result = preprocess.preprocess_dataset(
+                rows,
+                filename,
+                FakeTokenizer(),
+                max_tokens=5,
+                checkpoint_filename=checkpoint_filename,
+                resume_from=preprocess.load_checkpoint(checkpoint_filename),
+                progress_stream=StringIO(),
+            )
+            tokens = np.fromfile(filename, dtype=np.uint16).tolist()
+
+        self.assertEqual(result, (2, 5))
+        self.assertEqual(tokens, [97, 98, 99, 100, 101])
+
+    def test_resume_rejects_a_token_file_shorter_than_the_checkpoint(self):
+        with TemporaryDirectory() as directory:
+            filename = Path(directory) / "tokens.bin"
+            np.asarray([1, 2], dtype=np.uint16).tofile(filename)
+
+            with self.assertRaisesRegex(ValueError, "cannot resume"):
+                preprocess.preprocess_dataset(
+                    [{"text": "a"}],
+                    filename,
+                    FakeTokenizer(),
+                    resume_from={"rows": 3, "tokens": 9, "dataset_state": None},
+                    progress_stream=StringIO(),
+                )
+
+            # The file is left alone for the user to inspect.
+            self.assertEqual(np.fromfile(filename, dtype=np.uint16).tolist(), [1, 2])
+
+    def test_resume_rejects_a_checkpoint_from_different_settings(self):
+        checkpoint = {"dataset": preprocess.DATASET_SOURCE, "max_tokens": 100}
+
+        preprocess.check_resume_checkpoint(checkpoint, 100)
+        with self.assertRaisesRegex(ValueError, "max_tokens"):
+            preprocess.check_resume_checkpoint(checkpoint, None)
+        with self.assertRaisesRegex(ValueError, "dataset"):
+            preprocess.check_resume_checkpoint(
+                {"dataset": "other/data/train", "max_tokens": 100}, 100
+            )
+
+
+class MainTests(unittest.TestCase):
+    ROWS = [{"text": "abcd"}] * 4  # 20 tokens: 18 train, 2 val
+
+    def run_main(self, directory, *flags, rows=ROWS):
+        train = Path(directory) / "train.bin"
+        val = Path(directory) / "val.bin"
+        stderr = StringIO()
+        # Each clock reading is far past the last, so every row checkpoints.
+        clock = count(step=preprocess.CHECKPOINT_SECONDS)
+        with (
+            patch("pretraining.preprocess.load_streaming_dataset") as load,
+            patch("pretraining.preprocess.tiktoken.get_encoding") as get_encoding,
+            patch("pretraining.preprocess.time.monotonic", side_effect=clock.__next__),
+            redirect_stderr(stderr),
+        ):
+            load.return_value = rows
+            get_encoding.return_value = FakeTokenizer()
+            returncode = preprocess.main([str(train), str(val), *flags])
+        return returncode, train, val, stderr.getvalue(), load
+
+    def test_a_finished_run_leaves_no_checkpoint(self):
+        with TemporaryDirectory() as directory:
+            returncode, train, val, _, _ = self.run_main(directory)
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(train.stat().st_size, 18 * preprocess.TOKEN_BYTES)
+            self.assertEqual(val.stat().st_size, 2 * preprocess.TOKEN_BYTES)
+            self.assertFalse(preprocess.checkpoint_path(train).exists())
+
+    def test_resume_without_a_checkpoint_fails(self):
+        with TemporaryDirectory() as directory:
+            returncode, train, _, stderr, load = self.run_main(directory, "--resume")
+
+            self.assertEqual(returncode, 1)
+            self.assertIn("--resume found no checkpoint", stderr)
+            load.assert_not_called()
+            self.assertFalse(train.exists())
+
+    def test_resume_finishes_an_interrupted_run(self):
+        with TemporaryDirectory() as directory:
+            interrupted = self.ROWS[:2] + [{"text": None}]
+            returncode, train, val, _, _ = self.run_main(directory, rows=interrupted)
+            checkpoint = preprocess.load_checkpoint(preprocess.checkpoint_path(train))
+            self.assertEqual(returncode, 1)
+            self.assertEqual((checkpoint["rows"], checkpoint["tokens"]), (2, 10))
+
+            returncode, train, val, _, _ = self.run_main(directory, "--resume")
+            tokens = (
+                np.fromfile(train, dtype=np.uint16).tolist()
+                + np.fromfile(val, dtype=np.uint16).tolist()
+            )
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(tokens, [97, 98, 99, 100, 99] * 4)
+            self.assertFalse(preprocess.checkpoint_path(train).exists())
+
+    def test_resume_rejects_a_changed_token_limit(self):
+        with TemporaryDirectory() as directory:
+            self.run_main(directory, rows=self.ROWS[:2] + [{"text": None}])
+
+            returncode, _, _, stderr, load = self.run_main(
+                directory, "--resume", "--max-tokens", "8"
+            )
+
+            self.assertEqual(returncode, 1)
+            self.assertIn("cannot resume", stderr)
+            load.assert_not_called()
+
+    def test_resume_splits_without_retokenizing_when_only_the_split_is_left(self):
+        with TemporaryDirectory() as directory:
+            with patch(
+                "pretraining.preprocess.split_train_val", side_effect=OSError("disk")
+            ):
+                returncode, train, val, _, _ = self.run_main(directory)
+            self.assertEqual(returncode, 1)
+
+            returncode, train, val, _, load = self.run_main(directory, "--resume")
+
+            self.assertEqual(returncode, 0)
+            load.assert_not_called()
+            self.assertEqual(train.stat().st_size, 18 * preprocess.TOKEN_BYTES)
+            self.assertEqual(val.stat().st_size, 2 * preprocess.TOKEN_BYTES)
+            self.assertFalse(preprocess.checkpoint_path(train).exists())
+
+    def test_resume_does_not_split_twice(self):
+        with TemporaryDirectory() as directory:
+            # Interrupted after the split but before the checkpoint was removed.
+            with patch.object(Path, "unlink", side_effect=OSError("interrupted")):
+                returncode, train, val, _, _ = self.run_main(directory)
+            self.assertEqual(returncode, 1)
+            self.assertEqual(train.stat().st_size, 18 * preprocess.TOKEN_BYTES)
+
+            returncode, train, val, _, _ = self.run_main(directory, "--resume")
+
+            self.assertEqual(returncode, 0)
+            self.assertEqual(train.stat().st_size, 18 * preprocess.TOKEN_BYTES)
+            self.assertEqual(val.stat().st_size, 2 * preprocess.TOKEN_BYTES)
+            self.assertFalse(preprocess.checkpoint_path(train).exists())
+
+    def test_starting_over_warns_about_an_existing_checkpoint(self):
+        with TemporaryDirectory() as directory:
+            self.run_main(directory, rows=self.ROWS[:2] + [{"text": None}])
+
+            returncode, train, val, stderr, _ = self.run_main(directory)
+
+            self.assertEqual(returncode, 0)
+            self.assertIn("pass --resume to continue it", stderr)
+            self.assertEqual(train.stat().st_size, 18 * preprocess.TOKEN_BYTES)
 
 
 if __name__ == "__main__":
