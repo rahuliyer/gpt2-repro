@@ -24,7 +24,7 @@ class TrainingConfig:
     total_batch_size: int = 524_288  # 2**19 tokens per optimizer step (GPT-2 paper)
     max_lr: float = 6e-4
     min_lr: float = 6e-5
-    warmup_steps: int = 700
+    warmup_steps: int = 715
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.1
     dropout: float = 0.0
