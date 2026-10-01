@@ -24,7 +24,7 @@ class TrainingConfig:
     total_batch_size: int = 524_288  # 2**19 tokens per optimizer step (GPT-2 paper)
     max_lr: float = 6e-4
     min_lr: float = 6e-5
-    warmup_steps: int = 700
+    warmup_steps: int = 2
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.1
     dropout: float = 0.0
@@ -32,11 +32,11 @@ class TrainingConfig:
     max_steps: int | None = None  # None derives the count from the dataset
     num_workers: int = 4
     seed: int = 1337
-    log_interval: int = 10
-    eval_interval: int = 250
-    eval_iters: int = 20
+    log_interval: int = 1
+    eval_interval: int = 3
+    eval_iters: int = 5
     fused_optimizer: bool = True
-    checkpoint_interval: int = 1000
+    checkpoint_interval: int = 3
     keep_last_n: int = 3
     checkpoint_name: str = "gpt2"
     wandb_project: str = "gpt2-repro"
