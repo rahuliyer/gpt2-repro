@@ -36,7 +36,7 @@ class TrainingConfig:
     eval_interval: int = 3
     eval_iters: int = 5
     fused_optimizer: bool = True
-    checkpoint_interval: int = 3
+    checkpoint_interval: int = 1
     keep_last_n: int = 3
     checkpoint_name: str = "gpt2"
     wandb_project: str = "gpt2-repro"
