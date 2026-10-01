@@ -19,26 +19,27 @@ from model import GPT2, GPT2SmallConfig
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 1
+    batch_size: int = 64
     context_len: int = 1024
     total_batch_size: int = 524_288  # 2**19 tokens per optimizer step (GPT-2 paper)
     max_lr: float = 6e-4
     min_lr: float = 6e-5
-    warmup_steps: int = 100
+    warmup_steps: int = 700
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.1
     dropout: float = 0.0
-    max_steps: int = 5_000
-    num_workers: int = 0
+    epochs: float = 1.0
+    max_steps: int | None = None  # None derives the count from the dataset
+    num_workers: int = 4
     seed: int = 1337
-    log_interval: int = 1
-    eval_interval: int = 50
+    log_interval: int = 10
+    eval_interval: int = 250
     eval_iters: int = 20
-    fused_optimizer: bool = False
+    fused_optimizer: bool = True
     checkpoint_interval: int = 1000
     keep_last_n: int = 3
     checkpoint_name: str = "gpt2"
-    wandb_project: str = "gpt2-repro-test"
+    wandb_project: str = "gpt2-repro"
 
 
 def run_directory(checkpoint_dir, config, now=None):
@@ -147,6 +148,27 @@ def build_dataloader(dataset_path, config, offset=0):
 def usable_examples(dataset_length, batch_size):
     """Examples actually yielded per pass once the short final batch is dropped."""
     return (dataset_length // batch_size) * batch_size
+
+
+def resolve_max_steps(config, dataset_length):
+    """Optimizer steps needed to see `config.epochs` passes over the training file.
+
+    An explicit `max_steps` wins, which is what makes a short smoke run a
+    one-field change. Otherwise the count comes from the data, so it cannot go
+    stale when the dataset or the token budget changes. It drives the cosine
+    schedule as well as the stopping condition, so a wrong value trains for
+    the wrong length on a curve tuned for a different one.
+    """
+    if config.max_steps is not None:
+        return config.max_steps
+    tokens = usable_examples(dataset_length, config.batch_size) * config.context_len
+    steps = int(config.epochs * tokens) // config.total_batch_size
+    if steps < 1:
+        raise ValueError(
+            f"{tokens:,} usable tokens at {config.epochs} epoch(s) is less than one "
+            f"optimizer step of {config.total_batch_size:,} tokens"
+        )
+    return steps
 
 
 # Changing any of these invalidates the restored step counter, so a resume
@@ -306,6 +328,15 @@ def train(config, train_path, val_path, run_dir, state=None):
     use_bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
     grad_accum_steps = resolve_grad_accum_steps(config)
 
+    # Open the token file once up front: its length both derives the step count
+    # and turns examples_consumed into a resume offset. Resolution has to happen
+    # before check_resume_config so a resumed run's derived value compares equal
+    # to the one saved in the checkpoint.
+    probe = FineWebDataset(str(train_path), config.context_len)
+    dataset_length = len(probe)
+    del probe
+    config.max_steps = resolve_max_steps(config, dataset_length)
+
     model = GPT2(
         GPT2SmallConfig(context_len=config.context_len, dropout=config.dropout)
     ).to(device)
@@ -332,15 +363,11 @@ def train(config, train_path, val_path, run_dir, state=None):
     print(f"Compiling model...")
     compiled_model = torch.compile(model)
 
-    # Peek at the dataset length to turn examples consumed into an offset,
-    # then build the loader once with that offset already applied.
-    probe = FineWebDataset(str(train_path), config.context_len)
     # Modulo the examples actually yielded per pass, not the dataset length:
     # drop_last means each pass is short by len(dataset) % batch_size, and
     # using the raw length would drift by that much on every wrap.
-    per_pass = usable_examples(len(probe), config.batch_size)
+    per_pass = usable_examples(dataset_length, config.batch_size)
     offset = examples_consumed % per_pass if per_pass else 0
-    del probe
     dataset, dataloader = build_dataloader(train_path, config, offset=offset)
     # Validation always scores the same prefix, so it never takes an offset.
     _, val_dataloader = build_dataloader(val_path, config)
@@ -350,7 +377,9 @@ def train(config, train_path, val_path, run_dir, state=None):
         f"Training on {device} | {precision} | {len(dataset):,} examples "
         f"| {config.total_batch_size:,} tok/step "
         f"({grad_accum_steps} x {config.batch_size} x {config.context_len}) "
-        f"| {config.max_steps:,} steps max"
+        f"| {config.max_steps:,} steps "
+        f"({config.epochs:g} epoch(s), "
+        f"{config.max_steps * config.total_batch_size / 1e9:.2f}B tokens)"
     )
 
     if state is not None:
@@ -510,6 +539,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     config = TrainingConfig()
+    # Resolve before wandb.init so the run config records the real step count
+    # rather than None. train() resolves again and is a no-op once set.
+    config.max_steps = resolve_max_steps(
+        config, len(FineWebDataset(str(args.train_dataset), config.context_len))
+    )
 
     state = None
     if args.resume:

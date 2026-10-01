@@ -183,6 +183,65 @@ class UsableExamplesTests(unittest.TestCase):
         self.assertEqual(train.usable_examples(3, 4), 0)
 
 
+class ResolveMaxStepsTests(unittest.TestCase):
+    def config(self, **overrides):
+        defaults = {
+            "batch_size": 64,
+            "context_len": 1024,
+            "total_batch_size": 524_288,
+        }
+        return train.TrainingConfig(**(defaults | overrides))
+
+    def test_explicit_max_steps_wins(self):
+        config = self.config(max_steps=50)
+
+        # Derivation is skipped entirely, which is what makes a smoke run a
+        # one-field change.
+        self.assertEqual(train.resolve_max_steps(config, 10_000_000), 50)
+
+    def test_derives_one_epoch_from_the_dataset(self):
+        config = self.config()
+        length = 9_716_796
+
+        steps = train.resolve_max_steps(config, length)
+
+        expected = (
+            train.usable_examples(length, config.batch_size) * config.context_len
+        ) // config.total_batch_size
+        self.assertEqual(steps, expected)
+        # 8 accumulation steps x 64 x 1024 tokens per optimizer step.
+        self.assertEqual(steps, 18_978)
+
+    def test_fractional_epochs_scale_the_count(self):
+        length = 9_716_796
+        full = train.resolve_max_steps(self.config(), length)
+        half = train.resolve_max_steps(self.config(epochs=0.5), length)
+
+        self.assertEqual(half, full // 2)
+
+    def test_accounts_for_the_dropped_final_batch(self):
+        # 100 examples at batch 64 yields 64; the other 36 never appear, so
+        # counting the raw length would overstate the run.
+        config = self.config(total_batch_size=65_536)
+        steps = train.resolve_max_steps(config, 100)
+
+        self.assertEqual(steps, 1)
+
+    def test_too_little_data_for_one_step_is_an_error(self):
+        config = self.config()
+
+        with self.assertRaisesRegex(ValueError, "less than one optimizer step"):
+            train.resolve_max_steps(config, 100)
+
+    def test_derived_value_is_stable_across_calls(self):
+        # train() resolves again after main() has already assigned; the second
+        # call must not change the answer.
+        config = self.config()
+        first = train.resolve_max_steps(config, 9_716_796)
+        config.max_steps = first
+        self.assertEqual(train.resolve_max_steps(config, 9_716_796), first)
+
+
 class ResumeConfigTests(unittest.TestCase):
     def test_accepts_an_identical_config(self):
         config = train.TrainingConfig()

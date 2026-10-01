@@ -69,18 +69,64 @@ uv run python pretraining/train.py \
     --checkpoint-dir checkpoints
 ```
 
-The checkpoint directory is created if missing, and the filename is built
-from `checkpoint_name` in the config plus a timestamp — for example
-`checkpoints/gpt2_20260930_143022.safetensors` — so consecutive runs never
-overwrite each other.
-
 Hyperparameters live in the `TrainingConfig` dataclass at the top of
 `pretraining/train.py` — edit them there rather than passing flags. The
 defaults follow the GPT-2 paper: AdamW at 6e-4 with betas (0.9, 0.95) and
 0.1 weight decay applied to matrices but not to biases or LayerNorm scales,
-gradient clipping at 1.0, 100 warmup steps, and a cosine decay to 6e-5.
+gradient clipping at 1.0, 700 warmup steps, and a cosine decay to 6e-5.
 Weights initialize from N(0, 0.02), with the residual-path projections
 scaled by `1 / sqrt(2 * n_layers)`.
+
+### Run length
+
+`max_steps` defaults to `None`, meaning the step count is derived from the
+training file so it cannot go stale when the dataset or token budget changes:
+
+```
+max_steps = epochs * usable_tokens // total_batch_size
+```
+
+`epochs` defaults to `1.0` and accepts fractions, so half a pass is
+`epochs=0.5` rather than a recomputed step count. Setting `max_steps`
+explicitly overrides the derivation, which is the easy way to run a short
+smoke test. The derived value is printed at startup and is what drives the
+cosine schedule, not just the stopping condition.
+
+For the full FineWeb-Edu `sample-10BT` sample that works out to ~18,890
+steps over ~9.90B tokens.
+
+### Checkpoints
+
+Each fresh run creates its own timestamped directory under
+`--checkpoint-dir`; `--resume` continues inside the one it finds:
+
+```
+checkpoints/
+  gpt2_20260930_143022/
+    gpt2_step_018890.safetensors     final weights, tagged with the step
+    checkpoints/
+      step_017000.pt                 full training state
+      step_018000.pt
+```
+
+A state checkpoint every `checkpoint_interval` steps holds the model,
+optimizer moments, step counter, RNG state, data position and W&B run id —
+everything needed to continue, which the weights alone cannot do. Only the
+newest `keep_last_n` are kept (3 by default, ~1.5GB each).
+
+```bash
+uv run python pretraining/train.py \
+    --train-dataset datasets/fineweb/train.bin \
+    --val-dataset datasets/fineweb/val.bin \
+    --checkpoint-dir checkpoints \
+    --resume
+```
+
+`--resume` picks the newest checkpoint under `--checkpoint-dir`, restores the
+data stream to where it stopped, and reuses the W&B run so the loss curve
+stays continuous. Settings that would invalidate the restored step counter
+(`total_batch_size`, `batch_size`, `context_len`) are refused; everything else
+warns.
 
 ### Effective batch size
 
