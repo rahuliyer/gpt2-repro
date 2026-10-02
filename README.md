@@ -8,6 +8,8 @@ Transformers' training utilities.
 - `pretraining/` dataset preparation and the pretraining loop
 - `classification/` classification fine-tuning
 - `instruct/` instruction fine-tuning
+- `inference/` text completion
+- `utils/` helpers shared by the trainers (LR schedule, optimizer, run directories)
 
 ## Setup
 
@@ -179,6 +181,51 @@ Runs are tracked in Weights & Biases under the `wandb_project` name.
 is active, so importing and calling `train()` directly from a script or test
 never starts a tracked run. Set `WANDB_MODE=disabled` or `offline` to turn
 tracking off without touching code.
+
+## Classification
+
+Fine-tunes the released GPT-2 small weights to classify
+[AG News](https://huggingface.co/datasets/sh0416/ag_news) into its four
+topics. The last 10% of the training split is held out for validation. Each
+example is classified from the logits at its last real token, not at the
+padded end of the sequence.
+
+There is one script per setup, each a config passed to the shared loop in
+`classification/train.py`:
+
+| Script | Head | Backbone | Batch | Peak LR |
+|---|---|---|---|---|
+| `train_mlp_head.py` | MLP | frozen | 512 | 3e-4 |
+| `train_mlp_head_last_block.py` | MLP | last block trains | 128 | 1e-4 |
+| `train_linear_head_last_block.py` | single linear layer | last block trains | 128 | 1e-4 |
+| `train_linear_head_full.py` | single linear layer | everything trains | 32 | 3e-5 |
+
+"Last block" is the final transformer block together with the layer norm that
+follows it.
+
+```bash
+uv run python classification/train_mlp_head.py \
+    --checkpoint-dir checkpoints/classification \
+    --device-id 1
+```
+
+`--device-id` picks the GPU (0 or 1) and defaults to 0.
+
+Each run trains for `n_epochs` on a cosine learning rate schedule with linear
+warmup, and gets its own `<checkpoint_name>_<YYYYmmdd_HHMMSS>` directory under
+`--checkpoint-dir`:
+
+- `config.json` the training config, including the head and what was unfrozen
+- `best.safetensors` the full model at its lowest validation loss
+
+Validation runs over the whole held-out set every `val_interval` steps and
+once more on the final step. The test split is scored once at the end, with
+`best.safetensors` loaded back in rather than the last step's weights.
+
+Printed and logged training loss and accuracy are means over the examples seen
+since the previous log line, since a single batch is too noisy to read. Runs
+are tracked in the `gpt2-classification-sft` W&B project, one run per
+invocation, named after its run directory.
 
 ## Inspect token files
 

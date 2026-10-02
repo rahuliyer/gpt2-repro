@@ -2,8 +2,6 @@
 
 import argparse
 from dataclasses import asdict, dataclass
-from datetime import datetime
-import math
 from pathlib import Path
 import sys
 import time
@@ -15,6 +13,7 @@ import wandb
 
 from pretraining import FineWebDataset
 from model import GPT2, GPT2SmallConfig
+from utils import build_optimizer, get_lr, run_directory
 
 
 @dataclass
@@ -40,12 +39,6 @@ class TrainingConfig:
     keep_last_n: int = 3
     checkpoint_name: str = "gpt2"
     wandb_project: str = "gpt2-repro"
-
-
-def run_directory(checkpoint_dir, config, now=None):
-    """Build a timestamped directory so a fresh run never reuses another's."""
-    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
-    return Path(checkpoint_dir) / f"{config.checkpoint_name}_{stamp}"
 
 
 def state_checkpoint_path(run_dir, step):
@@ -88,17 +81,6 @@ class OffsetSampler(Sampler):
 
     def __len__(self):
         return self.length
-
-
-def get_lr(step, config):
-    """Cosine learning rate schedule with linear warmup."""
-    if step < config.warmup_steps:
-        return config.max_lr * (step + 1) / config.warmup_steps
-    if step >= config.max_steps:
-        return config.min_lr
-    decay_ratio = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return config.min_lr + coeff * (config.max_lr - config.min_lr)
 
 
 def resolve_grad_accum_steps(config):
@@ -252,37 +234,6 @@ def restore_rng_state(state):
     if cuda_state is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(cuda_state)
 
-def build_optimizer(model, config):
-    decay_params = []
-    no_decay_params = []
-
-    for _, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        if param.dim() >= 2:
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
-
-    optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": decay_params,
-                "weight_decay": config.weight_decay,
-            },
-            {
-                "params": no_decay_params,
-                "weight_decay": 0.0,
-            },
-        ],
-        lr=config.max_lr,
-        betas=config.betas,
-        eps=1e-8,
-        fused=config.fused_optimizer
-    )
-
-    return optimizer
 
 @torch.no_grad()
 def estimate_val_loss(model, val_dataloader, device, use_bf16, max_batches=None):
