@@ -19,7 +19,7 @@ class GPT2SmallConfig(GPTConfig):
     n_layers: int = 12
     n_embed: int = 768
     context_len: int = 1024
-    dropout: float = 0.4
+    dropout: float = 0.0
 
 
 GPTSmallConfig = GPT2SmallConfig
