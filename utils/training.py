@@ -1,6 +1,8 @@
-"""Training helpers shared by the pretraining and classification trainers."""
+"""Training helpers shared by the pretraining, classification and instruct trainers."""
 
+from dataclasses import asdict
 from datetime import datetime
+import json
 import math
 from pathlib import Path
 
@@ -11,6 +13,13 @@ def run_directory(checkpoint_dir, config, now=None):
     """Build a timestamped directory so a fresh run never reuses another's."""
     stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
     return Path(checkpoint_dir) / f"{config.checkpoint_name}_{stamp}"
+
+
+def save_config(run_dir, config):
+    """Write the run's config next to its checkpoint."""
+    path = Path(run_dir) / "config.json"
+    path.write_text(json.dumps(asdict(config), indent=2) + "\n")
+    return path
 
 
 def get_lr(step, config):

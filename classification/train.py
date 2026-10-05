@@ -2,7 +2,6 @@
 
 import argparse
 from dataclasses import asdict, dataclass
-import json
 import math
 from pathlib import Path
 import sys
@@ -17,7 +16,7 @@ import wandb
 
 from classification import get_datasets
 from classification.classifier import get_last_logits, load_pretrained_classifier
-from utils import build_optimizer, get_lr, run_directory
+from utils import build_optimizer, get_lr, run_directory, save_config
 
 
 @dataclass
@@ -48,13 +47,6 @@ def resolve_max_steps(config, num_examples):
     if config.max_steps is not None:
         return config.max_steps
     return config.n_epochs * math.ceil(num_examples / config.batch_size)
-
-
-def save_config(run_dir, config):
-    """Write the run's config next to its checkpoint."""
-    path = Path(run_dir) / "config.json"
-    path.write_text(json.dumps(asdict(config), indent=2) + "\n")
-    return path
 
 
 def best_checkpoint_path(run_dir):

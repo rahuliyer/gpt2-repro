@@ -21,5 +21,25 @@ class GPT2SmallConfig(GPTConfig):
     context_len: int = 1024
     dropout: float = 0.0
 
+@dataclass
+class GPT2MediumConfig(GPTConfig):
+    vocab_size: int = 50257
+    d_model: int = 1024
+    n_heads: int = 16
+    n_layers: int = 24
+    n_embed: int = 1024
+    context_len: int = 1024
+    dropout: float = 0.0
+
+@dataclass
+class GPT2LargeConfig(GPTConfig):
+    vocab_size: int = 50257
+    d_model: int = 1280
+    n_heads: int = 20
+    n_layers: int = 36
+    n_embed: int = 1280
+    context_len: int = 1024
+    dropout: float = 0.0
+
 
 GPTSmallConfig = GPT2SmallConfig

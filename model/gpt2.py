@@ -145,3 +145,37 @@ class GPT2(nn.Module):
     def save(self, checkpoint_path):
         save_model(self, checkpoint_path)
 
+    @torch.no_grad()
+    def extend_token_embeddings(self, vocab_size):
+        old_vocab_size = self.weight_embedding.num_embeddings
+
+        assert self.config.vocab_size == old_vocab_size
+        assert self.lm_head.out_features == old_vocab_size
+        assert vocab_size >= old_vocab_size
+
+        emb = nn.Embedding(
+            vocab_size, 
+            self.config.n_embed, 
+            dtype=self.weight_embedding.weight.dtype, 
+            device=self.weight_embedding.weight.device
+        )
+
+        # Init new rows to the mean embedding. GPT-2's logits for real tokens
+        # are around -100, so small random rows (logits near 0) would
+        # outscore every real token through the tied lm_head.
+        emb.weight[:old_vocab_size, :].copy_(self.weight_embedding.weight)
+        emb.weight[old_vocab_size:, :].copy_(self.weight_embedding.weight.mean(dim=0))
+        self.weight_embedding = emb
+
+        # rebuild the lm head
+        self.lm_head = nn.Linear(
+            self.config.n_embed, 
+            vocab_size, 
+            bias=False, 
+            dtype=self.lm_head.weight.dtype, 
+            device = self.lm_head.weight.device
+        )
+        
+        self.lm_head.weight = self.weight_embedding.weight
+
+        self.config.vocab_size = vocab_size
