@@ -16,7 +16,7 @@ import wandb
 from inference import generate_text
 from instruct import SmolTalkDataset, get_tokenizer
 from instruct.chat import encode_prompt
-from instruct.chat_model import MODEL_SIZES, build_model
+from instruct.chat_model import build_model
 from instruct.smalltalk_dataset import collate_fn
 from instruct.tokenizer import ASSISTANT_END_TOKEN, IGNORE_TOKEN_ID
 from utils import build_optimizer, get_lr, run_directory, save_config
@@ -25,10 +25,11 @@ from utils import build_optimizer, get_lr, run_directory, save_config
 @dataclass
 class TrainingConfig:
     checkpoint_name: str = "instruct"
-    model_size: str = "small"  # a key of MODEL_SIZES, set by --model-size
+    model_size: str = "small"  # a key of MODEL_SIZES
     batch_size: int = 2  # conversations per micro-batch
     grad_accum_steps: int = 16  # micro-batches per optimizer step
     eval_batch_size: int = 4
+    num_workers: int = 4  # tokenize training batches off the main process
     max_lr: float = 5e-5
     min_lr: float = 5e-6
     warmup_steps: int = 100
@@ -153,7 +154,12 @@ def train(model, tokenizer, config, datasets, run_dir, device):
     collate = partial(collate_fn, pad_id=tokenizer.eot_token)
 
     train_dataloader = DataLoader(
-        train_ds, batch_size=config.batch_size, shuffle=True, collate_fn=collate
+        train_ds,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate,
+        num_workers=config.num_workers,
+        persistent_workers=config.num_workers > 0,
     )
     # Unshuffled, so every validation scores the same conversations.
     val_dataloader = DataLoader(
@@ -299,14 +305,7 @@ def main(config, argv=None):
         default=0,
         help="Index of the GPU to train on.",
     )
-    parser.add_argument(
-        "--model-size",
-        choices=sorted(MODEL_SIZES),
-        default=config.model_size,
-        help="Pretrained GPT-2 to fine-tune.",
-    )
     args = parser.parse_args(argv)
-    config.model_size = args.model_size
 
     device = f"cuda:{args.device_id}" if torch.cuda.is_available() else "cpu"
 
