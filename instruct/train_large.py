@@ -7,8 +7,8 @@ from instruct.train import TrainingConfig, main
 CONFIG = TrainingConfig(
     checkpoint_name="instruct_large",
     model_size="large",
-    batch_size=8,
-    grad_accum_steps=4,
+    batch_size=16,
+    grad_accum_steps=2,
     eval_batch_size=16,
     max_lr=2e-5,
     min_lr=2e-6,
