@@ -11,6 +11,21 @@ Transformers' training utilities.
 - `inference/` text completion
 - `utils/` helpers shared by the trainers (LR schedule, optimizer, run directories)
 
+## Weights
+
+The trained weights are on Hugging Face. Each model card has loading code.
+
+| Model | Hugging Face | Write-up |
+|---|---|---|
+| GPT-2 small pretrained from scratch on FineWeb-Edu | [rahuliyer/gpt2-small-fineweb-edu](https://huggingface.co/rahuliyer/gpt2-small-fineweb-edu) | [pretraining](pretraining/README.md) |
+| GPT-2 small fine-tuned on AG News (four setups) | [rahuliyer/gpt2-small-ag-news](https://huggingface.co/rahuliyer/gpt2-small-ag-news) | [classification](classification/README.md) |
+| GPT-2 small instruction-tuned on SmolTalk | [rahuliyer/gpt2-small-smoltalk](https://huggingface.co/rahuliyer/gpt2-small-smoltalk) | [instruct](instruct/README.md) |
+| GPT-2 medium instruction-tuned on SmolTalk | [rahuliyer/gpt2-medium-smoltalk](https://huggingface.co/rahuliyer/gpt2-medium-smoltalk) | [instruct](instruct/README.md) |
+| GPT-2 large instruction-tuned on SmolTalk | [rahuliyer/gpt2-large-smoltalk](https://huggingface.co/rahuliyer/gpt2-large-smoltalk) | [instruct](instruct/README.md) |
+
+The weights load into this repository's `GPT2` class, not Hugging Face
+Transformers' `GPT2LMHeadModel`.
+
 ## Setup
 
 Install the locked dependencies with [uv](https://docs.astral.sh/uv/):
